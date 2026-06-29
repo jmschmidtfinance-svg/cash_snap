@@ -28,7 +28,7 @@
 | API integration record name | `[FILL IN]` |
 | Role used by the integration | `[FILL IN — note its permission scope]` |
 | Base currency / consolidation currency | `[FILL IN]` |
-| Single subsidiary or multi-subsidiary? | `[FILL IN — drives subsidiary filtering everywhere below]` |
+| Single subsidiary or multi-subsidiary? | Single subsidiary |
 
 Notes / gotchas about access:
 - `[FILL IN — e.g. role lacks access to certain saved searches; rate limits; concurrency]`
@@ -57,7 +57,7 @@ Decisions to record:
 
 | Segment | NetSuite field | What it means for us | Values that matter |
 |---|---|---|---|
-| Subsidiary | `transactionline.subsidiary` | `[FILL IN]` | `[FILL IN]` |
+| Subsidiary | `transactionline.subsidiary` | Single subsidiary — no filtering needed | n/a |
 | Department | `transactionline.department` | `[FILL IN]` | `[FILL IN]` |
 | Class | `transactionline.class` | `[FILL IN]` | `[FILL IN]` |
 | Location | `transactionline.location` | `[FILL IN]` | `[FILL IN]` |
@@ -110,7 +110,6 @@ JOIN   account a     ON a.id = tal.account
 WHERE  a.accttype = 'Bank'
   AND  tal.posting = 'T'
   AND  t.trandate <= TO_DATE(:as_of_date, 'YYYY-MM-DD')
-  -- AND t.subsidiary = :subsidiary_id   -- enable for multi-subsidiary
 GROUP BY a.id, a.acctnumber, a.fullname
 ```
 
@@ -133,14 +132,18 @@ JOIN   account a     ON a.id = tal.account
 WHERE  a.accttype = 'Bank'
   AND  tal.posting = 'T'
   AND  t.trandate = TO_DATE(:snap_date, 'YYYY-MM-DD')
-  -- AND t.subsidiary = :subsidiary_id
 ORDER BY tal.amount
 ```
+
+> **Pipeline note:** the live pipeline widens 6b to the range `(prior_business_day,
+> report_date]` so the bucketized movements reconcile to the balance delta across weekends
+> and holidays. The single-day form above is kept for ad-hoc lookups.
 
 ### Sign convention `[FILL IN — VERIFY]`
 For a Bank account, a cash **increase** posts as a debit. Confirm whether `tal.amount`
 returns inflows as positive or negative in this instance, and record it here. The whole
-snap's directionality depends on this one fact.
+snap's directionality depends on this one fact. (The pipeline assumes inflow = positive and
+will flag a reconciliation mismatch on the first run if that is wrong.)
 
 ### Schema gotchas
 - Prefer `transactionaccountingline` over `transactionline` for posting amounts (handles
@@ -178,8 +181,8 @@ Special rules / exclusions:
 | Audience | CEO |
 | Cadence | Daily, by `[FILL IN time / timezone]` |
 | Compares | Closing cash `[today]` vs `[prior business day]` |
-| Delivery channel | `[FILL IN — email / Slack / doc]` |
-| "Call out" threshold | Any single item or bucket moving more than `[FILL IN $]` |
+| Delivery channel | Email to me; I forward to the CEO |
+| "Call out" threshold | Any single item or bucket moving more than `[FILL IN $]` (SNAP_THRESHOLD) |
 
 Required contents of the snap:
 1. Total cash, today vs prior, and the net change.
@@ -205,11 +208,11 @@ Tone/format the CEO prefers: `[FILL IN — bullet brief vs. short paragraph; lev
 
 | Component | Choice |
 |---|---|
-| Scheduler / host | `[FILL IN — cron / GitHub Actions / cloud function / Airflow]` |
-| Language | Python `[CONFIRM]` |
-| Secrets store | `[FILL IN]` |
-| LLM model | `[FILL IN — e.g. claude-sonnet-4-6]` |
-| Failure handling | `[FILL IN — alert on empty results, SuiteQL error, balance mismatch]` |
+| Scheduler / host | GitHub Actions (scheduled workflow) |
+| Language | Python |
+| Secrets store | GitHub Actions encrypted secrets |
+| LLM model | claude-sonnet-4-6 |
+| Failure handling | Alert email on empty results, SuiteQL error, or reconciliation mismatch |
 
 Design rule: **code computes, the LLM explains.** The model receives finished numbers; it
 never categorizes or sums.
@@ -226,4 +229,4 @@ never categorizes or sums.
 
 | Date | Change | By |
 |---|---|---|
-| `[FILL IN]` | Initial skeleton created | |
+| 2026-06-29 | Initial skeleton + pipeline wired (single subsidiary, GitHub Actions, email delivery) | |

@@ -14,11 +14,8 @@ sees it; the model only writes prose.
 ├── requirements.txt
 ├── netsuite_knowledge_base.md   # your KB — loaded as context for the narrative
 └── .github/workflows/
-    └── cash_snap.yml            # scheduled daily run
+    └── cash_snap.yml            # the scheduled workflow
 ```
-
-The workflow lives at `.github/workflows/cash_snap.yml` so GitHub Actions picks it up
-automatically.
 
 ## One-time setup
 
