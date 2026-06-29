@@ -1,0 +1,39 @@
+name: Daily cash snap
+
+on:
+  schedule:
+    # 11:00 UTC daily. NOTE: GitHub cron is UTC-only and best-effort (can be delayed
+    # under load), and does not adjust for DST. Pick a time with enough margin before
+    # you need the report. For guaranteed timing, move this script to a cloud function
+    # behind a scheduler — the code is unchanged.
+    - cron: "0 11 * * *"
+  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+
+jobs:
+  cash-snap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run cash snap
+        env:
+          NS_ACCOUNT_ID:     ${{ secrets.NS_ACCOUNT_ID }}
+          NS_CONSUMER_KEY:   ${{ secrets.NS_CONSUMER_KEY }}
+          NS_CONSUMER_SECRET: ${{ secrets.NS_CONSUMER_SECRET }}
+          NS_TOKEN_ID:       ${{ secrets.NS_TOKEN_ID }}
+          NS_TOKEN_SECRET:   ${{ secrets.NS_TOKEN_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SMTP_HOST:         ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:         ${{ secrets.SMTP_PORT }}
+          SMTP_USER:         ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD:     ${{ secrets.SMTP_PASSWORD }}
+          MAIL_FROM:         ${{ secrets.MAIL_FROM }}
+          MAIL_TO:           ${{ secrets.MAIL_TO }}
+          SNAP_THRESHOLD:    ${{ vars.SNAP_THRESHOLD }}
+        run: python cash_snap.py
