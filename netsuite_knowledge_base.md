@@ -20,36 +20,40 @@
 
 | Item | Value |
 |---|---|
-| NetSuite account ID (realm) | `[FILL IN]` |
-| Environment | Production / Sandbox `[FILL IN]` |
-| Auth method | Token-Based Auth (TBA) / OAuth 2.0 `[FILL IN — pick one]` |
+| NetSuite account ID (realm) | stored in `NS_ACCOUNT_ID` GitHub secret (not recorded here) |
+| Environment | Production |
+| Auth method | Token-Based Auth (TBA) — confirmed working 2026-06-29 |
 | SuiteQL endpoint | `https://<accountId>.suitetalk.api.netsuite.com/services/rest/query/v1/suiteql` |
-| Where credentials live | `[FILL IN — e.g. AWS Secrets Manager path / env var names]` |
-| API integration record name | `[FILL IN]` |
-| Role used by the integration | `[FILL IN — note its permission scope]` |
-| Base currency / consolidation currency | `[FILL IN]` |
+| Where credentials live | GitHub Actions encrypted secrets: `NS_ACCOUNT_ID`, `NS_CONSUMER_KEY`, `NS_CONSUMER_SECRET`, `NS_TOKEN_ID`, `NS_TOKEN_SECRET` |
+| API integration record name | `Claude - Scanner 2` (State: Enabled, TBA checked) |
+| Role used by the integration | Dedicated least-privilege API role (NOT a borrowed privileged role). See §10. |
+| Base currency / consolidation currency | USD `[CONFIRM]` |
 | Single subsidiary or multi-subsidiary? | Single subsidiary |
 
 Notes / gotchas about access:
-- `[FILL IN — e.g. role lacks access to certain saved searches; rate limits; concurrency]`
+- The token is bound to a (user + role) pair. Use a **dedicated, active, least-privilege API
+  role** — a borrowed privileged role (e.g. Controller) can fail at login with
+  `EntityOrRoleDisabled` even when the role is active and assigned. See §10.
 
 ---
 
 ## 2. Cash / bank accounts
 
-These are the accounts the daily cash snap tracks. In NetSuite, cash accounts are GL
-accounts of type **Bank** (`account.accttype = 'Bank'`). Confirm this list matches reality
-and update whenever an account is opened/closed.
+Cash accounts are GL accounts of type **Bank** (`account.accttype = 'Bank'`). Confirmed via
+the first successful run (2026-06-29). Update whenever an account is opened/closed.
 
-| Internal ID | Acct # | Account name | Subsidiary | Currency | Purpose / notes |
-|---|---|---|---|---|---|
-| `[FILL IN]` | | | | | e.g. main operating |
-| `[FILL IN]` | | | | | e.g. payroll funding |
-| `[FILL IN]` | | | | | e.g. money market / sweep |
+| Internal ID | Acct # | Account name | Currency | Purpose / notes |
+|---|---|---|---|---|
+| `[FILL IN]` | `[FILL IN]` | First Bank | USD | **Main operating account — effectively all daily cash activity flows through here.** |
+| `[FILL IN]` | `[FILL IN]` | Brokerage Account | USD | Effectively static (~$8.4k on 2026-06-29); no daily movement. |
+| `[FILL IN]` | `[FILL IN]` | First Bank of the Lake | USD | Effectively static (~$302). |
+| `[FILL IN]` | `[FILL IN]` | Petty Cash | USD | Effectively static (~$212). |
 
 Decisions to record:
-- Do we include money-market / sweep / investment accounts in "cash"? `[FILL IN]`
-- Any restricted-cash accounts to exclude or report separately? `[FILL IN]`
+- Only **First Bank** is transactional day to day; the other three carry static balances.
+  The snap still reports all four so a balance change in a "static" account would surface.
+- Money-market / sweep / investment accounts in "cash"? Brokerage Account is included today
+  as a Bank-type account. `[CONFIRM whether it should be treated as cash]`
 
 ---
 
@@ -74,30 +78,30 @@ Decisions to record:
 
 ## 5. Transaction types in use
 
-SuiteQL exposes the internal type code on `transaction.type` (e.g. `CustPymt`). Use
-`BUILTIN.DF(t.type)` to get the human-readable label. Confirm the codes below against the
-instance — they vary by NetSuite version/config.
+SuiteQL exposes the internal type code on `transaction.type`. Use `BUILTIN.DF(t.type)` for
+the human label. **Confirmed against real data on 2026-06-29** unless noted.
 
-| Type code (verify) | Label | Touches cash? | Typical bucket |
-|---|---|---|---|
-| `CustPymt` | Customer Payment | Yes | AR collections |
-| `Deposit` | Deposit | Yes | AR collections / other inflow |
-| `VendPymt` | Bill Payment | Yes | AP disbursements |
-| `Check` | Check | Yes | AP / misc disbursement |
-| `Paycheck` | Paycheck | Yes | Payroll |
-| `Transfer` | Funds Transfer | Yes (net zero) | Internal transfer — EXCLUDE |
-| `Journal` | Journal Entry | Sometimes | depends on accounts — see §7 |
-| `[FILL IN]` | | | |
+| Type code | Label (BUILTIN.DF) | Touches cash? | Bucket | Verified |
+|---|---|---|---|---|
+| `CustPymt` | **Payment** (note: shows as "Payment", not "Customer Payment") | Yes | AR collections | ✅ |
+| `Deposit` | Deposit | Yes | AR collections | ✅ |
+| `VendPymt` | Bill Payment | Yes | AP disbursements | ✅ |
+| `Check` | Check | Yes | AP disbursements | ✅ |
+| `Journal` | Journal | Sometimes | Other / unclassified (see §7, §10) | ✅ |
+| `Paycheck` | Paycheck | Yes | Payroll | not yet seen |
+| `Transfer` | Funds Transfer | Yes (net zero) | Internal transfer — EXCLUDE | not yet seen |
+
+> Gotcha: a Customer Payment's display label is **"Payment"**, not "Customer Payment" — don't
+> filter on the label, filter on the `CustPymt` type code.
 
 ---
 
-## 6. SuiteQL reference (validate against the instance)
+## 6. SuiteQL reference (validated against the instance)
 
-> These are starting templates. **Validating column names, the `amount` sign convention,
-> and `posting`/`type` codes against our account is itself part of building this KB** — once
-> verified, mark them ✅ and they become canonical.
+> 6a and 6b both ran successfully on 2026-06-29 and the results reconciled exactly. These
+> are now canonical.
 
-### 6a. Cash balance as of a date  `[ ] verified`
+### 6a. Cash balance as of a date  ✅ verified 2026-06-29
 
 ```sql
 SELECT a.id            AS account_id,
@@ -113,7 +117,7 @@ WHERE  a.accttype = 'Bank'
 GROUP BY a.id, a.acctnumber, a.fullname
 ```
 
-### 6b. Day's movements hitting bank accounts (detail for bucketizing)  `[ ] verified`
+### 6b. Day's movements hitting bank accounts (detail for bucketizing)  ✅ verified 2026-06-29
 
 ```sql
 SELECT t.id            AS tran_id,
@@ -137,17 +141,16 @@ ORDER BY tal.amount
 
 > **Pipeline note:** the live pipeline widens 6b to the range `(prior_business_day,
 > report_date]` so the bucketized movements reconcile to the balance delta across weekends
-> and holidays. The single-day form above is kept for ad-hoc lookups.
+> and holidays. Confirmed: the 2026-06-29 run spanned Fri 6/26 → Mon 6/29 and tied out.
 
-### Sign convention `[FILL IN — VERIFY]`
-For a Bank account, a cash **increase** posts as a debit. Confirm whether `tal.amount`
-returns inflows as positive or negative in this instance, and record it here. The whole
-snap's directionality depends on this one fact. (The pipeline assumes inflow = positive and
-will flag a reconciliation mismatch on the first run if that is wrong.)
+### Sign convention  ✅ VERIFIED 2026-06-29
+For a Bank account, a cash **increase** posts as a positive `tal.amount` (debit-positive).
+Inflows are positive, outflows negative. **Confirmed:** the first run reconciled to the
+penny with `INFLOW_IS_POSITIVE = True`, so this is settled for our instance.
 
 ### Schema gotchas
-- Prefer `transactionaccountingline` over `transactionline` for posting amounts (handles
-  multiple accounting books). `[VERIFY which book]`
+- Use `transactionaccountingline` for posting amounts (handles multiple accounting books).
+  Working as expected with the default book.
 - `[FILL IN — voided transactions, in-transit deposits, undeposited funds, FX revaluation]`
 
 ---
@@ -155,22 +158,28 @@ will flag a reconciliation mismatch on the first run if that is wrong.)
 ## 7. Cash bucket mapping (the reusable business logic)
 
 Each posting line that hits a cash account is assigned to exactly one bucket. Rule order:
-first match wins. Adjust the buckets and rules to how the CEO thinks about cash.
+first match wins.
 
 | Priority | Match condition | Bucket | Notes |
 |---|---|---|---|
-| 1 | `type_code = 'Transfer'` OR both legs internal | `Internal transfer` | **Excluded** from net flow (nets to zero) |
-| 2 | `type_code IN ('CustPymt','Deposit')` | `AR collections` | |
-| 3 | `type_code = 'Paycheck'` OR account in payroll set | `Payroll` | |
-| 4 | `type_code IN ('VendPymt','Check')` | `AP disbursements` | |
-| 5 | `type_code = 'Journal'` AND account = `[debt acct]` | `Debt service` | |
-| 6 | `type_code = 'Journal'` AND account = `[tax acct]` | `Taxes` | |
+| 1 | `type_code = 'Transfer'` OR both legs internal | `Internal transfer` | **Excluded** from net flow (nets to zero). Not yet seen in data. |
+| 2 | `type_code IN ('CustPymt','Deposit')` | `AR collections` | ✅ confirmed |
+| 3 | `type_code = 'Paycheck'` OR account in payroll set | `Payroll` | not yet seen |
+| 4 | `type_code IN ('VendPymt','Check')` | `AP disbursements` | ✅ confirmed |
+| 5 | `type_code = 'Journal'` AND account = `[debt acct]` | `Debt service` | `[FILL IN debt acct]` |
+| 6 | `type_code = 'Journal'` AND account = `[tax acct]` | `Taxes` | `[FILL IN tax acct]` |
 | 99 | (fallback) | `Other / unclassified` | Flag for review if material |
 
 Special rules / exclusions:
 - Internal transfers between our own bank accounts must net to zero — exclude from the
-  net-change explanation but show them if a single account moved materially. `[CONFIRM]`
-- `[FILL IN — sweeps, FX revaluation, reclasses, in-transit timing]`
+  net-change explanation but show them if a single account moved materially. (Not yet
+  observed in data.)
+- **Bank-interest journals** (small `Journal` entries hitting First Bank, e.g. JE14865
+  +$69.36 on 2026-06-29) currently fall to `Other / unclassified`. DECISION PENDING: add a
+  rule mapping small bank-leg journals to a `Bank interest / adjustments` bucket, or do the
+  offset-account lookup so journals classify by their non-bank leg. See §10.
+- Note: `Check` is currently bucketed as `AP disbursements`, but some checks are lease/loan
+  payments (e.g. Ford Credit, MBFS). `[CONSIDER]` routing these to `Debt service` later.
 
 ---
 
@@ -178,11 +187,11 @@ Special rules / exclusions:
 
 | Item | Value |
 |---|---|
-| Audience | CEO |
-| Cadence | Daily, by `[FILL IN time / timezone]` |
-| Compares | Closing cash `[today]` vs `[prior business day]` |
-| Delivery channel | Email to me; I forward to the CEO |
-| "Call out" threshold | Any single item or bucket moving more than `[FILL IN $]` (SNAP_THRESHOLD) |
+| Audience | CEO (Jamie receives it and forwards) |
+| Cadence | Daily, 11:00 UTC (GitHub Actions cron) |
+| Compares | Closing cash today vs prior business day |
+| Delivery channel | Email from `jmschmidtfinance@gmail.com` → Jamie's inbox; Jamie forwards to CEO |
+| "Call out" threshold | `SNAP_THRESHOLD` = 10000 (any single item or bucket beyond this is flagged) |
 
 Required contents of the snap:
 1. Total cash, today vs prior, and the net change.
@@ -192,35 +201,50 @@ Required contents of the snap:
    balances, large unexpected single transactions.
 5. `[FILL IN — runway / forecast tie-in, if the CEO wants it]`
 
-Tone/format the CEO prefers: `[FILL IN — bullet brief vs. short paragraph; level of detail]`
+Tone/format: short headline + bulleted drivers + a flags section.
+> KNOWN ISSUE (pending fix): the model emits Markdown but the email is sent as plain text,
+> so `**bold**` and pipe tables render as raw characters. Fix = send HTML (render the
+> Markdown), or instruct the model to emit plain text only.
 
 ---
 
 ## 9. Pipeline overview
 
 ```
-[scheduler] -> [SuiteQL: §6a balances + §6b day movements]
+[GitHub Actions cron] -> [SuiteQL: §6a balances + §6b range movements]
             -> [code: assign bucket per §7, net by bucket, compute movers + flags]
             -> [structured summary JSON]
             -> [one Anthropic API call: summary + this KB -> CEO narrative]
-            -> [deliver via §8 channel]
+            -> [email to Jamie; Jamie forwards to CEO]
 ```
 
 | Component | Choice |
 |---|---|
-| Scheduler / host | GitHub Actions (scheduled workflow) |
+| Scheduler / host | GitHub Actions (scheduled workflow), repo `jmschmidtfinance-svg/cash_snap` |
 | Language | Python |
 | Secrets store | GitHub Actions encrypted secrets |
 | LLM model | claude-sonnet-4-6 |
 | Failure handling | Alert email on empty results, SuiteQL error, or reconciliation mismatch |
 
 Design rule: **code computes, the LLM explains.** The model receives finished numbers; it
-never categorizes or sums.
+never categorizes or sums. (Validated end-to-end 2026-06-29.)
 
 ---
 
 ## 10. Institutional knowledge / running gotchas
 
+- **Integration role (2026-06-29):** the token must use a dedicated, active, least-privilege
+  API role. A borrowed privileged role ("Highland - Controller (Diane)") failed at login
+  with `EntityOrRoleDisabled` even though it was active and assigned to the user — swapping
+  to a dedicated API role fixed it immediately. The dedicated role needs **Log in using
+  Access Tokens** + **REST Web Services** (Setup) and **View** on Transactions and Accounts.
+- **Sign convention confirmed (2026-06-29):** inflows post positive; the first run
+  reconciled exactly.
+- **Cash accounts:** only First Bank is transactional; Brokerage, First Bank of the Lake,
+  and Petty Cash are effectively static.
+- **Bank-interest journals:** small `Journal` entries to First Bank (e.g. +$69.36) land in
+  `Other / unclassified` and are almost certainly bank interest/adjustments — see §7
+  decision pending.
 - `[FILL IN — month-end timing effects, holiday calendars, when deposits clear, etc.]`
 
 ---
@@ -230,3 +254,4 @@ never categorizes or sums.
 | Date | Change | By |
 |---|---|---|
 | 2026-06-29 | Initial skeleton + pipeline wired (single subsidiary, GitHub Actions, email delivery) | |
+| 2026-06-29 | First successful end-to-end run. Verified sign convention (inflow positive); marked §6a/6b queries canonical; populated cash accounts (§2) and transaction types (§5); recorded dedicated-API-role fix for `EntityOrRoleDisabled` (§10); set threshold = 10000; noted Markdown-in-plain-text email issue and bank-interest-journal decision. | |
