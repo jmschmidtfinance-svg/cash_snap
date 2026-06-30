@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-Daily cash snap pipeline (single subsidiary).
+Daily cash snap pipeline (single subsidiary) -- v2.
 
-Flow:  SuiteQL balances + movements  ->  deterministic bucketizing + reconciliation
-       ->  structured summary  ->  one Anthropic call for the CEO narrative  ->  email to you.
+Cash perimeter = Bank accounts + Undeposited Funds (accttype IN ('Bank','UnDepFunds')).
+"Cash" is the combined balance; a Deposit (UF -> Bank) is internal and nets to zero.
 
-Design rule: CODE COMPUTES, THE LLM EXPLAINS. Every number is finished before the model
-sees it. The model never categorizes or sums.
+Reconciliation is a stateful ROLL-FORWARD:
+  last *reported* balance (from state file)  +  captured movements  ==  today's computed balance
+Captured movements = postings to cash accounts that are dated in the window OR were created
+since the last snapshot (catches back-dated entries). State is persisted to state/cash_state.json
+and committed back to the repo by the workflow, which also serves as an audit ledger.
 
-Config is entirely via environment variables (see README). No secrets in this file.
+Design rule: CODE COMPUTES, THE LLM EXPLAINS. The model only writes the CFO narrative and the
+CEO text-message block from finished numbers.
 """
 
 from __future__ import annotations
@@ -20,16 +24,16 @@ import json
 import os
 import smtplib
 import sys
+from collections import defaultdict
 from email.message import EmailMessage
 
 import requests
 from requests_oauthlib import OAuth1
 
-
 # --------------------------------------------------------------------------------------
 # Config (env vars only)
 # --------------------------------------------------------------------------------------
-NS_ACCOUNT_ID   = os.environ["NS_ACCOUNT_ID"]          # e.g. "1234567" or "1234567_SB1"
+NS_ACCOUNT_ID   = os.environ["NS_ACCOUNT_ID"]
 NS_CONSUMER_KEY = os.environ["NS_CONSUMER_KEY"]
 NS_CONSUMER_SEC = os.environ["NS_CONSUMER_SECRET"]
 NS_TOKEN_ID     = os.environ["NS_TOKEN_ID"]
@@ -37,215 +41,258 @@ NS_TOKEN_SEC    = os.environ["NS_TOKEN_SECRET"]
 
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 KB_PATH         = os.environ.get("KB_PATH", "netsuite_knowledge_base.md")
+STATE_PATH      = os.environ.get("STATE_PATH", "state/cash_state.json")
 
 SMTP_HOST = os.environ["SMTP_HOST"]
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ["SMTP_USER"]
 SMTP_PASS = os.environ["SMTP_PASSWORD"]
 MAIL_FROM = os.environ.get("MAIL_FROM", SMTP_USER)
-MAIL_TO   = os.environ["MAIL_TO"]                       # your inbox; you forward to the CEO
+MAIL_TO   = os.environ["MAIL_TO"]
 
-# Any single line OR any bucket moving more than this gets called out. See KB §8.
-THRESHOLD = float(os.environ.get("SNAP_THRESHOLD", "50000"))
-
-# Optional hard override of the reporting date (ISO yyyy-mm-dd); otherwise auto.
+THRESHOLD = float(os.environ.get("SNAP_THRESHOLD") or "50000")
 REPORT_DATE_OVERRIDE = os.environ.get("REPORT_DATE")
 
-# --- The one fact you MUST verify against the instance (KB §6 sign convention). ---------
-# In transactionaccountingline, a cash INFLOW to a Bank account normally posts as a
-# positive (debit) amount. If your instance returns inflows as negative, set this False.
-# The reconciliation check below will FAIL LOUDLY if this is wrong, so trust it to catch you.
+# Sign convention VERIFIED 2026-06-29: cash inflow posts positive. Reconciliation catches errors.
 INFLOW_IS_POSITIVE = True
 
-# --- Bucketizing config. Populate the account-id sets from KB §2 / §7 to light up the ---
-# --- payroll/debt/tax rules. Until then, those lines fall through to "Other".         ---
-PAYROLL_ACCOUNT_IDS: set[int] = set()      # bank accounts used purely to fund payroll
-DEBT_ACCOUNT_ID: int | None = None         # GL account that journals hit for debt service
-TAX_ACCOUNT_ID:  int | None = None         # GL account that journals hit for taxes
+# The cash perimeter. UnDepFunds = Undeposited Funds (its own NetSuite account type, even
+# though it classifies as Other Current Asset on the balance sheet). [VERIFY this type code
+# matches the instance; if UF is a custom OthCurrAsset account, switch to explicit ids below.]
+CASH_ACCT_TYPES = ("Bank", "UnDepFunds")
 
-EPSILON = 0.01  # reconciliation tolerance in currency units
+PAYROLL_ACCOUNT_IDS: set[int] = set()
+TOP_CEO_ITEMS = 8            # how many vendors/customers to itemize before "All others"
+EPSILON = 0.01
 
 
 # --------------------------------------------------------------------------------------
 # SuiteQL client
 # --------------------------------------------------------------------------------------
 def _rest_host() -> str:
-    # Account 1234567_SB1 -> host 1234567-sb1.suitetalk.api.netsuite.com
     return f"{NS_ACCOUNT_ID.lower().replace('_', '-')}.suitetalk.api.netsuite.com"
 
 
 def _auth() -> OAuth1:
-    # NetSuite TBA: OAuth 1.0a, HMAC-SHA256, realm = account id (original form).
     return OAuth1(
-        client_key=NS_CONSUMER_KEY,
-        client_secret=NS_CONSUMER_SEC,
-        resource_owner_key=NS_TOKEN_ID,
-        resource_owner_secret=NS_TOKEN_SEC,
-        signature_method="HMAC-SHA256",
-        realm=NS_ACCOUNT_ID,
+        client_key=NS_CONSUMER_KEY, client_secret=NS_CONSUMER_SEC,
+        resource_owner_key=NS_TOKEN_ID, resource_owner_secret=NS_TOKEN_SEC,
+        signature_method="HMAC-SHA256", realm=NS_ACCOUNT_ID,
     )
 
 
 def run_suiteql(sql: str, page_size: int = 1000) -> list[dict]:
-    """Run a SuiteQL statement, following pagination, returning all rows as dicts."""
     url = f"https://{_rest_host()}/services/rest/query/v1/suiteql"
     headers = {"Content-Type": "application/json", "Prefer": "transient"}
     auth = _auth()
-    rows: list[dict] = []
-    offset = 0
+    rows, offset = [], 0
     while True:
-        resp = requests.post(
-            url,
-            params={"limit": page_size, "offset": offset},
-            headers=headers,
-            auth=auth,
-            json={"q": sql},
-            timeout=60,
-        )
+        resp = requests.post(url, params={"limit": page_size, "offset": offset},
+                             headers=headers, auth=auth, json={"q": sql}, timeout=60)
         if resp.status_code != 200:
             raise RuntimeError(f"SuiteQL {resp.status_code}: {resp.text[:500]}")
         body = resp.json()
         rows.extend(body.get("items", []))
         if not body.get("hasMore"):
-            break
+            return rows
         offset += page_size
-    return rows
+
+
+def _types_in(types: tuple[str, ...]) -> str:
+    return ", ".join(f"'{t}'" for t in types)
 
 
 # --------------------------------------------------------------------------------------
-# Dates
+# Dates  (fire after midnight Eastern; report the day that just closed)
 # --------------------------------------------------------------------------------------
+def resolve_report_date() -> dt.date:
+    if REPORT_DATE_OVERRIDE:
+        return dt.date.fromisoformat(REPORT_DATE_OVERRIDE)
+    return (dt.datetime.utcnow() - dt.timedelta(days=1)).date()
+
+
 def previous_business_day(d: dt.date) -> dt.date:
-    """Most recent weekday strictly before d. (Holidays are a known gap — see KB §10.)"""
     d -= dt.timedelta(days=1)
-    while d.weekday() >= 5:  # 5=Sat, 6=Sun
+    while d.weekday() >= 5:
         d -= dt.timedelta(days=1)
     return d
 
 
-def resolve_dates() -> tuple[dt.date, dt.date]:
-    """report_date = day we report the close of; prior_date = the business day before it."""
-    if REPORT_DATE_OVERRIDE:
-        report = dt.date.fromisoformat(REPORT_DATE_OVERRIDE)
-    else:
-        # Default: report the most recent fully-closed business day. Adjust to your
-        # convention by setting REPORT_DATE, or change this line.
-        report = previous_business_day(dt.date.today())
-    return report, previous_business_day(report)
-
-
 # --------------------------------------------------------------------------------------
-# Queries  (single subsidiary -> no subsidiary filter needed; KB §6)
+# Queries
 # --------------------------------------------------------------------------------------
-def balances_as_of(d: dt.date) -> list[dict]:
+def balances_as_of(d: dt.date, acct_types: tuple[str, ...],
+                   created_on_or_before: dt.date | None = None) -> list[dict]:
+    """Posting balance as of trandate <= d.
+
+    If created_on_or_before is given, also require the entry to have been CREATED by then --
+    i.e. reconstruct the balance as it actually stood at close, excluding anything back-posted
+    afterward. Used to synthesize a clean prior baseline on the bootstrap run.
+    """
+    created_clause = (
+        f"AND TRUNC(t.createddate) <= TO_DATE('{created_on_or_before.isoformat()}', 'YYYY-MM-DD')"
+        if created_on_or_before else ""
+    )
     sql = f"""
-        SELECT a.id AS account_id, a.acctnumber, a.fullname,
+        SELECT a.id AS account_id, a.acctnumber, a.fullname, a.accttype,
                SUM(tal.amount) AS balance
         FROM   transactionaccountingline tal
         JOIN   transaction t ON t.id = tal.transaction
         JOIN   account a     ON a.id = tal.account
-        WHERE  a.accttype = 'Bank'
+        WHERE  a.accttype IN ({_types_in(acct_types)})
           AND  tal.posting = 'T'
           AND  t.trandate <= TO_DATE('{d.isoformat()}', 'YYYY-MM-DD')
-        GROUP BY a.id, a.acctnumber, a.fullname
+          {created_clause}
+        GROUP BY a.id, a.acctnumber, a.fullname, a.accttype
     """
     return run_suiteql(sql)
 
 
-def movements_between(prior: dt.date, report: dt.date) -> list[dict]:
-    """All bank-account posting lines in (prior, report]. Spanning the full range (not just
-    one day) is what makes the buckets reconcile to the balance delta across weekends."""
+def total_balance(d: dt.date, acct_types: tuple[str, ...],
+                  created_on_or_before: dt.date | None = None) -> float:
+    return sum(float(r["balance"]) for r in balances_as_of(d, acct_types, created_on_or_before))
+
+
+def cash_movements(prior: dt.date, report: dt.date, include_created: bool) -> list[dict]:
+    """Cash-account postings new since the prior snapshot.
+
+    include_created=True: dated in window OR created since prior_date. Used by both the logged
+      path (prior = last reported balance) and the bootstrap path (prior = reconstructed
+      created-on-or-before baseline) -- both are true roll-forwards that surface back-posts.
+    include_created=False: dated in window only. Kept for a naive recompute if ever needed.
+    """
+    created_clause = (
+        f"OR TRUNC(t.createddate) > TO_DATE('{prior.isoformat()}', 'YYYY-MM-DD')"
+        if include_created else ""
+    )
     sql = f"""
-        SELECT t.id AS tran_id, t.tranid, t.trandate,
+        SELECT t.id AS tran_id, t.tranid, t.trandate, t.createddate,
                t.type AS type_code, BUILTIN.DF(t.type) AS type_label,
-               a.id AS account_id, a.acctnumber, a.fullname AS account_name,
+               a.id AS account_id, a.acctnumber, a.fullname AS account_name, a.accttype,
                BUILTIN.DF(t.entity) AS entity_name, t.memo, tal.amount
         FROM   transactionaccountingline tal
         JOIN   transaction t ON t.id = tal.transaction
         JOIN   account a     ON a.id = tal.account
-        WHERE  a.accttype = 'Bank'
+        WHERE  a.accttype IN ({_types_in(CASH_ACCT_TYPES)})
           AND  tal.posting = 'T'
-          AND  t.trandate >  TO_DATE('{prior.isoformat()}', 'YYYY-MM-DD')
           AND  t.trandate <= TO_DATE('{report.isoformat()}', 'YYYY-MM-DD')
+          AND  ( t.trandate > TO_DATE('{prior.isoformat()}', 'YYYY-MM-DD') {created_clause} )
         ORDER BY tal.amount
     """
     return run_suiteql(sql)
 
 
 # --------------------------------------------------------------------------------------
-# Bucketizing (KB §7, first match wins)
+# State (roll-forward anchor + audit ledger)
 # --------------------------------------------------------------------------------------
-def signed(amount: float) -> float:
-    """Normalize to: positive = cash IN, negative = cash OUT."""
+def load_state() -> dict | None:
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_state(report: dt.date, total_cash: float, balances: list[dict]) -> None:
+    os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
+    payload = {
+        "report_date": report.isoformat(),
+        "total_cash": round(total_cash, 2),
+        "balances": {str(r["account_id"]): {"name": r["fullname"],
+                                             "balance": round(float(r["balance"]), 2)}
+                     for r in balances},
+    }
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+# --------------------------------------------------------------------------------------
+# Bucketizing
+# --------------------------------------------------------------------------------------
+def signed(amount) -> float:
     a = float(amount)
     return a if INFLOW_IS_POSITIVE else -a
 
 
 def classify(row: dict) -> str:
     tc = (row.get("type_code") or "").strip()
-    acct = row.get("account_id")
-    if tc == "Transfer":
-        return "Internal transfer"
-    if tc in ("CustPymt", "Deposit"):
+    if tc in ("Transfer", "Deposit"):
+        return "Internal transfer"          # Deposit = UF -> Bank, internal to cash perimeter
+    if tc == "CustPymt":
         return "AR collections"
-    if tc == "Paycheck" or (acct in PAYROLL_ACCOUNT_IDS):
+    if tc == "Paycheck" or row.get("account_id") in PAYROLL_ACCOUNT_IDS:
         return "Payroll"
     if tc in ("VendPymt", "Check"):
         return "AP disbursements"
-    if tc == "Journal":
-        # NOTE: the movement query returns only the BANK leg, so we can't see a journal's
-        # offsetting account here. Once DEBT/TAX account ids are known, classify journals
-        # with a small secondary lookup of their non-bank lines. Until then -> Other.
-        return "Other / unclassified"
-    return "Other / unclassified"
+    return "Other / unclassified"           # Journals etc. -- see KB sec.7 / sec.10
 
 
 # --------------------------------------------------------------------------------------
-# Summary assembly (everything the LLM will need, already computed)
+# Summary assembly
 # --------------------------------------------------------------------------------------
-def build_summary(report: dt.date, prior: dt.date,
-                  bal_today: list[dict], bal_prior: list[dict],
-                  movements: list[dict]) -> dict:
-    by_acct_today = {r["account_id"]: float(r["balance"]) for r in bal_today}
-    by_acct_prior = {r["account_id"]: float(r["balance"]) for r in bal_prior}
-    names = {r["account_id"]: r["fullname"] for r in (bal_today + bal_prior)}
+def _itemize(rows: list[dict], inflow: bool) -> list[dict]:
+    """Group external (non-internal) movements by entity, signed, sorted by magnitude."""
+    agg: dict[str, float] = defaultdict(float)
+    for r in rows:
+        if classify(r) == "Internal transfer":
+            continue
+        amt = signed(r["amount"])
+        if (amt > 0) != inflow:
+            continue
+        key = r.get("entity_name") or (r.get("memo") or "Other")
+        agg[key] += amt
+    items = [{"name": k, "amount": round(v, 2)} for k, v in agg.items()]
+    items.sort(key=lambda x: abs(x["amount"]), reverse=True)
+    return items
 
-    total_today = sum(by_acct_today.values())
-    total_prior = sum(by_acct_prior.values())
-    net_change = total_today - total_prior
 
-    # Net by bucket
-    buckets: dict[str, float] = {}
+def build_summary(report: dt.date, prior_date: dt.date, prior_total: float,
+                  prior_source: str, bal_today: list[dict], movements: list[dict],
+                  ar_total: float, ap_total: float) -> dict:
+    by_acct = {r["account_id"]: float(r["balance"]) for r in bal_today}
+    names = {r["account_id"]: r["fullname"] for r in bal_today}
+    total_today = sum(by_acct.values())
+    net_change = total_today - prior_total
+
+    buckets: dict[str, float] = defaultdict(float)
     movement_net = 0.0
     for r in movements:
         amt = signed(r["amount"])
         movement_net += amt
-        buckets[classify(r)] = buckets.get(classify(r), 0.0) + amt
+        buckets[classify(r)] += amt
 
-    bucket_list = sorted(
-        ({"bucket": b, "net": round(v, 2)} for b, v in buckets.items()),
-        key=lambda x: abs(x["net"]), reverse=True,
-    )
+    bucket_list = sorted(({"bucket": b, "net": round(v, 2)} for b, v in buckets.items()),
+                         key=lambda x: abs(x["net"]), reverse=True)
 
-    # Reconciliation: signed movements over the window must equal the balance delta.
-    recon_diff = round(movement_net - net_change, 2)
+    recon_diff = round((prior_total + movement_net) - total_today, 2)
     recon_ok = abs(recon_diff) <= EPSILON
 
-    # Largest single transactions (exclude internal transfer legs from "drivers")
-    drivers = [r for r in movements if classify(r) != "Internal transfer"]
-    drivers.sort(key=lambda r: abs(signed(r["amount"])), reverse=True)
-    top_movers = [{
-        "tranid": r.get("tranid"), "date": r.get("trandate"),
-        "type": r.get("type_label"), "entity": r.get("entity_name"),
-        "account": r.get("account_name"), "memo": r.get("memo"),
-        "amount": round(signed(r["amount"]), 2), "bucket": classify(r),
-    } for r in drivers[:5]]
+    drivers = sorted((r for r in movements if classify(r) != "Internal transfer"),
+                     key=lambda r: abs(signed(r["amount"])), reverse=True)
+    top_movers = [{"tranid": r.get("tranid"), "date": r.get("trandate"),
+                   "type": r.get("type_label"), "entity": r.get("entity_name"),
+                   "account": r.get("account_name"), "memo": r.get("memo"),
+                   "amount": round(signed(r["amount"]), 2), "bucket": classify(r)}
+                  for r in drivers[:5]]
+
+    cash_in_items = _itemize(movements, inflow=True)
+    cash_out_all = _itemize(movements, inflow=False)
+    cash_in_total = round(sum(i["amount"] for i in cash_in_items), 2)
+    cash_out_total = round(sum(i["amount"] for i in cash_out_all), 2)
+    cash_out_items = cash_out_all[:TOP_CEO_ITEMS]
+    others = cash_out_all[TOP_CEO_ITEMS:]
+    cash_out_other = round(sum(i["amount"] for i in others), 2) if others else 0.0
 
     flags = []
     if not recon_ok:
-        flags.append(f"RECONCILIATION MISMATCH: movements {movement_net:,.2f} vs balance "
-                     f"delta {net_change:,.2f} (diff {recon_diff:,.2f}). Check sign "
-                     f"convention / undeposited funds / posting filter before trusting.")
+        flags.append(f"RECONCILIATION MISMATCH: logged prior {prior_total:,.2f} + movements "
+                     f"{movement_net:,.2f} = {prior_total + movement_net:,.2f}, but computed "
+                     f"today {total_today:,.2f} (diff {recon_diff:,.2f}). Treat as provisional.")
+    if prior_source == "bootstrap":
+        flags.append(f"First run / no prior reported balance on file -- prior balance was "
+                     f"reconstructed as of {prior_date} excluding entries back-posted "
+                     f"afterward; any such back-posts appear in today's movements. Relies on "
+                     f"createddate reflecting when entries hit the books.")
     for b in bucket_list:
         if abs(b["net"]) >= THRESHOLD and b["bucket"] != "Internal transfer":
             flags.append(f"Bucket over threshold: {b['bucket']} net {b['net']:,.2f}")
@@ -255,38 +302,62 @@ def build_summary(report: dt.date, prior: dt.date,
                          f"({m['entity'] or m['memo'] or m['tranid']})")
     other_net = buckets.get("Other / unclassified", 0.0)
     if abs(other_net) > EPSILON:
-        flags.append(f"Unclassified cash movement of {other_net:,.2f} — needs a §7 rule.")
-    for aid, bal in by_acct_today.items():
+        flags.append(f"Unclassified cash movement of {other_net:,.2f} -- needs a sec.7 rule.")
+    for aid, bal in by_acct.items():
         if bal < 0:
             flags.append(f"Negative balance: {names.get(aid, aid)} at {bal:,.2f}")
 
     return {
         "report_date": report.isoformat(),
-        "prior_date": prior.isoformat(),
-        "currency_note": "amounts normalized so positive = cash in, negative = cash out",
+        "prior_date": prior_date.isoformat(),
+        "prior_source": prior_source,
+        "currency_note": "positive = cash in, negative = cash out",
         "total_cash_today": round(total_today, 2),
-        "total_cash_prior": round(total_prior, 2),
+        "total_cash_prior": round(prior_total, 2),
         "net_change": round(net_change, 2),
+        "ar_total": round(ar_total, 2),
+        "ap_total": round(ap_total, 2),
+        "unpaid_bills": None,   # TODO: define overdue-vs-open and add query (KB sec.8)
+        "account_balances": [{"account": names.get(aid, aid), "balance": round(by_acct[aid], 2),
+                              "type": next((r["accttype"] for r in bal_today
+                                            if r["account_id"] == aid), "")}
+                             for aid in sorted(by_acct, key=lambda a: str(names.get(a, a)))],
         "by_bucket": bucket_list,
         "top_movers": top_movers,
-        "account_balances": [
-            {"account": names.get(aid, aid),
-             "today": round(by_acct_today.get(aid, 0.0), 2),
-             "prior": round(by_acct_prior.get(aid, 0.0), 2),
-             "change": round(by_acct_today.get(aid, 0.0) - by_acct_prior.get(aid, 0.0), 2)}
-            for aid in sorted(set(by_acct_today) | set(by_acct_prior),
-                              key=lambda a: str(names.get(a, a)))
-        ],
+        "cash_in": {"total": cash_in_total, "items": cash_in_items},
+        "cash_out": {"total": cash_out_total, "items": cash_out_items,
+                     "all_others": cash_out_other},
         "reconciles": recon_ok,
         "flags": flags,
     }
 
 
 # --------------------------------------------------------------------------------------
-# LLM narrative (the ONLY place the model is involved)
+# LLM narrative -- CFO section + CEO text-message block (one call, two delimited parts)
 # --------------------------------------------------------------------------------------
-def write_narrative(summary: dict) -> str:
-    from anthropic import Anthropic  # picks up ANTHROPIC_API_KEY from env
+CEO_STYLE_EXAMPLE = """\
+6/30
+
+Cash: $4.1m
+AR: $5.6m
+AP: $2.6m
+Unpaid bills: $19k
+
+Cash in: $882k
+W.M. Jordan - $537k
+Mayfair - $262k
+Service - $17k
+
+Cash out: $333k
+QXO - $96k
+CMP - $49k
+Superior - $37k
+All others $48k
+"""
+
+
+def write_sections(summary: dict) -> tuple[str, str]:
+    from anthropic import Anthropic
 
     kb = ""
     if os.path.exists(KB_PATH):
@@ -294,37 +365,41 @@ def write_narrative(summary: dict) -> str:
             kb = f.read()
 
     system = (
-        "You write a daily cash snap for a CEO. You receive FINISHED numbers and a knowledge "
-        "base describing how this company's NetSuite cash data is structured. Do not "
-        "recompute, re-categorize, or sum anything — the figures are authoritative. Explain "
-        "in plain language WHY cash moved, naming the drivers from by_bucket and top_movers. "
-        "Lead with total cash today vs prior and the net change. Surface every item in "
-        "'flags' clearly. Keep it to a tight executive brief: a one-line headline, then a "
-        "short paragraph or a few bullets. If 'reconciles' is false, say so prominently and "
-        "treat the numbers as provisional."
+        "You produce a daily cash report from FINISHED numbers. Do not recompute, "
+        "re-categorize, or sum -- the figures are authoritative. Output PLAIN TEXT only: no "
+        "Markdown, no asterisks, no pipe tables (the email is plain text). Return EXACTLY two "
+        "sections separated by the delimiters shown, nothing before or after:\n"
+        "<<<CFO>>>\n"
+        "A precise CFO brief. One-line headline, then the drivers (by_bucket and top_movers), "
+        "then every item in 'flags'. Keep full dollar figures with cents. If 'reconciles' is "
+        "false, lead with that and call the numbers provisional.\n"
+        "<<<CEO>>>\n"
+        "A short text-message-style summary matching this exact format and rounding "
+        "(round to $k/$m, abbreviate vendor/customer names sensibly, use 'All others' for the "
+        "cash_out all_others amount; if unpaid_bills is null, write 'Unpaid bills: [tbd]'):\n"
+        f"{CEO_STYLE_EXAMPLE}"
     )
-    user = (
-        f"KNOWLEDGE BASE:\n{kb}\n\n"
-        f"TODAY'S COMPUTED SUMMARY (JSON):\n{json.dumps(summary, indent=2, default=str)}"
-    )
+    user = (f"KNOWLEDGE BASE:\n{kb}\n\nTODAY'S COMPUTED SUMMARY (JSON):\n"
+            f"{json.dumps(summary, indent=2, default=str)}")
 
     client = Anthropic()
-    resp = client.messages.create(
-        model=ANTHROPIC_MODEL,
-        max_tokens=1500,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
+    resp = client.messages.create(model=ANTHROPIC_MODEL, max_tokens=2000,
+                                  system=system, messages=[{"role": "user", "content": user}])
+    text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+    cfo, ceo = text, ""
+    if "<<<CEO>>>" in text:
+        cfo, ceo = text.split("<<<CEO>>>", 1)
+    cfo = cfo.replace("<<<CFO>>>", "").strip()
+    return cfo, ceo.strip()
 
 
 # --------------------------------------------------------------------------------------
-# Delivery (email to you; you forward to the CEO)
+# Delivery
 # --------------------------------------------------------------------------------------
 def movements_csv(movements: list[dict]) -> str:
     buf = io.StringIO()
-    cols = ["tranid", "trandate", "type_label", "account_name",
-            "entity_name", "memo", "amount"]
+    cols = ["tranid", "trandate", "createddate", "type_label", "account_name",
+            "accttype", "entity_name", "memo", "amount"]
     w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
     w.writeheader()
     for r in movements:
@@ -332,33 +407,42 @@ def movements_csv(movements: list[dict]) -> str:
     return buf.getvalue()
 
 
-def bucket_table(summary: dict) -> str:
-    lines = [f"  {b['bucket']:<22} {b['net']:>16,.2f}" for b in summary["by_bucket"]]
+def cfo_detail_block(summary: dict) -> str:
+    """Deterministic long-form, full values with cents -- the audit view."""
+    lines = [f"Cash today ({summary['report_date']}): {summary['total_cash_today']:,.2f}"]
+    for a in summary["account_balances"]:
+        lines.append(f"    {a['account']:<26} {a['balance']:>16,.2f}  [{a['type']}]")
+    lines.append(f"Prior reported ({summary['prior_date']}): {summary['total_cash_prior']:,.2f}"
+                 f"   (source: {summary['prior_source']})")
+    lines.append(f"Net change: {summary['net_change']:,.2f}")
+    lines.append(f"AR total: {summary['ar_total']:,.2f}    AP total: {summary['ap_total']:,.2f}")
+    lines.append("")
+    lines.append("By bucket:")
+    for b in summary["by_bucket"]:
+        lines.append(f"    {b['bucket']:<22} {b['net']:>16,.2f}")
+    lines.append("")
+    lines.append(f"Reconciles (roll-forward): {summary['reconciles']}")
     return "\n".join(lines)
 
 
-def send_email(summary: dict, narrative: str, movements: list[dict]) -> None:
+def send_email(summary: dict, cfo_narrative: str, ceo_block: str, movements: list[dict]) -> None:
     msg = EmailMessage()
-    msg["Subject"] = f"Cash snap — {summary['report_date']}"
-    msg["From"] = MAIL_FROM
-    msg["To"] = MAIL_TO
-
+    msg["Subject"] = f"Cash snap -- {summary['report_date']}"
+    msg["From"], msg["To"] = MAIL_FROM, MAIL_TO
     body = (
-        f"{narrative}\n\n"
-        f"{'-' * 48}\n"
-        f"Total cash {summary['report_date']}: {summary['total_cash_today']:,.2f}\n"
-        f"Prior      {summary['prior_date']}: {summary['total_cash_prior']:,.2f}\n"
-        f"Net change:                {summary['net_change']:,.2f}\n\n"
-        f"By bucket:\n{bucket_table(summary)}\n\n"
-        f"Reconciles to balance delta: {summary['reconciles']}\n"
-        f"(full numbers in the attached JSON; line detail in the CSV)\n"
+        "===== CFO VIEW =====\n\n"
+        f"{cfo_narrative}\n\n"
+        "----- detail (full values) -----\n"
+        f"{cfo_detail_block(summary)}\n\n\n"
+        "===== CEO OUTPUT =====\n\n"
+        f"{ceo_block}\n\n"
+        "(full numbers in the attached JSON; line detail in the CSV)\n"
     )
     msg.set_content(body)
     msg.add_attachment(json.dumps(summary, indent=2, default=str).encode(),
                        maintype="application", subtype="json",
                        filename=f"cash_snap_{summary['report_date']}.json")
-    msg.add_attachment(movements_csv(movements).encode(),
-                       maintype="text", subtype="csv",
+    msg.add_attachment(movements_csv(movements).encode(), maintype="text", subtype="csv",
                        filename=f"cash_movements_{summary['report_date']}.csv")
     _smtp_send(msg)
 
@@ -366,13 +450,12 @@ def send_email(summary: dict, narrative: str, movements: list[dict]) -> None:
 def send_alert(error: str) -> None:
     msg = EmailMessage()
     msg["Subject"] = "Cash snap FAILED"
-    msg["From"] = MAIL_FROM
-    msg["To"] = MAIL_TO
+    msg["From"], msg["To"] = MAIL_FROM, MAIL_TO
     msg.set_content(f"The cash snap pipeline failed and produced no report.\n\n{error}")
     try:
         _smtp_send(msg)
     except Exception:
-        pass  # alert is best-effort; the non-zero exit still surfaces in the scheduler log
+        pass
 
 
 def _smtp_send(msg: EmailMessage) -> None:
@@ -392,22 +475,45 @@ def _smtp_send(msg: EmailMessage) -> None:
 # --------------------------------------------------------------------------------------
 def main() -> int:
     try:
-        report, prior = resolve_dates()
-        bal_today = balances_as_of(report)
-        bal_prior = balances_as_of(prior)
-        movements = movements_between(prior, report)
-
+        report = resolve_report_date()
+        bal_today = balances_as_of(report, CASH_ACCT_TYPES)
         if not bal_today:
-            raise RuntimeError("No bank-account balances returned — check the query, the "
-                               "role's permissions, or that accttype='Bank' is correct.")
+            raise RuntimeError("No cash-account balances returned -- check role permissions "
+                               "or that accttype IN ('Bank','UnDepFunds') matches the instance.")
+        total_today = sum(float(r["balance"]) for r in bal_today)
 
-        summary = build_summary(report, prior, bal_today, bal_prior, movements)
-        narrative = write_narrative(summary)
-        send_email(summary, narrative, movements)
+        state = load_state()
+        if state and state.get("report_date"):
+            prior_date = dt.date.fromisoformat(state["report_date"])
+            prior_total = float(state["total_cash"])
+            prior_source = "logged"
+            include_created = True
+        else:
+            prior_date = previous_business_day(report)
+            # Reconstruct the prior balance as it actually stood at prior_date's close --
+            # EXCLUDING anything back-posted afterward (created after prior_date). Those
+            # back-posts then surface in this run's movements via include_created=True, so the
+            # first run is a true roll-forward instead of a naive recompute that would bury them.
+            prior_total = total_balance(prior_date, CASH_ACCT_TYPES,
+                                        created_on_or_before=prior_date)
+            prior_source = "bootstrap"
+            include_created = True
+
+        movements = cash_movements(prior_date, report, include_created)
+        ar_total = abs(total_balance(report, ("AcctRec",)))
+        ap_total = abs(total_balance(report, ("AcctPay",)))
+
+        summary = build_summary(report, prior_date, prior_total, prior_source,
+                                bal_today, movements, ar_total, ap_total)
+        cfo_narrative, ceo_block = write_sections(summary)
+        send_email(summary, cfo_narrative, ceo_block, movements)
+
+        # Log only after a successful send; the workflow commits this file.
+        save_state(report, total_today, bal_today)
         print(f"Cash snap sent for {report.isoformat()} "
               f"(reconciles={summary['reconciles']}, flags={len(summary['flags'])}).")
         return 0
-    except Exception as exc:  # noqa: BLE001 — top-level guard for a scheduled job
+    except Exception as exc:  # noqa: BLE001
         send_alert(f"{type(exc).__name__}: {exc}")
         print(f"FAILED: {exc}", file=sys.stderr)
         return 1

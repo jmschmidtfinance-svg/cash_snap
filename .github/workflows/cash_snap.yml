@@ -2,12 +2,16 @@ name: Daily cash snap
 
 on:
   schedule:
-    # 11:00 UTC daily. NOTE: GitHub cron is UTC-only and best-effort (can be delayed
-    # under load), and does not adjust for DST. Pick a time with enough margin before
-    # you need the report. For guaranteed timing, move this script to a cloud function
-    # behind a scheduler — the code is unchanged.
-    - cron: "0 11 * * *"
-  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+    # 05:30 UTC = just after midnight US/Eastern year-round (00:30 EST / 01:30 EDT), so the
+    # reported day is fully closed before we pull. report_date defaults to "yesterday".
+    # GitHub cron is best-effort; a missed run self-heals because the roll-forward reconciles
+    # against the last *logged* balance over whatever gap occurred.
+    - cron: "30 5 * * *"
+  workflow_dispatch: {}
+
+# Needed so the job can commit the persisted state file (state/cash_state.json) back to the repo.
+permissions:
+  contents: write
 
 jobs:
   cash-snap:
@@ -37,3 +41,12 @@ jobs:
           MAIL_TO:           ${{ secrets.MAIL_TO }}
           SNAP_THRESHOLD:    ${{ vars.SNAP_THRESHOLD }}
         run: python cash_snap.py
+
+      - name: Persist reported balance (audit ledger)
+        if: success()
+        run: |
+          git config user.name  "cash-snap-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state/cash_state.json
+          git diff --staged --quiet || git commit -m "state: reported cash balance"
+          git push
