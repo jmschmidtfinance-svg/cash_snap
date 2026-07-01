@@ -7,7 +7,12 @@ on:
     # GitHub cron is best-effort; a missed run self-heals because the roll-forward reconciles
     # against the last *logged* balance over whatever gap occurred.
     - cron: "30 5 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      report_date:
+        description: "Override report date (YYYY-MM-DD). Leave blank for yesterday."
+        required: false
+        default: ""
 
 # Needed so the job can commit the persisted state file (state/cash_state.json) back to the repo.
 permissions:
@@ -40,6 +45,8 @@ jobs:
           MAIL_FROM:         ${{ secrets.MAIL_FROM }}
           MAIL_TO:           ${{ secrets.MAIL_TO }}
           SNAP_THRESHOLD:    ${{ vars.SNAP_THRESHOLD }}
+          CASH_EXTRA_ACCOUNT_IDS: ${{ vars.CASH_EXTRA_ACCOUNT_IDS }}
+          REPORT_DATE:       ${{ github.event.inputs.report_date }}
         run: python cash_snap.py
 
       - name: Persist reported balance (audit ledger)

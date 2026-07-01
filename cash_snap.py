@@ -56,10 +56,16 @@ REPORT_DATE_OVERRIDE = os.environ.get("REPORT_DATE")
 # Sign convention VERIFIED 2026-06-29: cash inflow posts positive. Reconciliation catches errors.
 INFLOW_IS_POSITIVE = True
 
-# The cash perimeter. UnDepFunds = Undeposited Funds (its own NetSuite account type, even
-# though it classifies as Other Current Asset on the balance sheet). [VERIFY this type code
-# matches the instance; if UF is a custom OthCurrAsset account, switch to explicit ids below.]
-CASH_ACCT_TYPES = ("Bank", "UnDepFunds")
+# The cash perimeter = Bank-type accounts PLUS any explicit account IDs (Undeposited Funds).
+# We select UF by explicit internal ID, NOT by account type: this instance's UF account is not
+# type 'UnDepFunds', so the type filter silently matched nothing and made UF invisible in
+# balances AND movements (deposits then looked like a phantom inflow). Set CASH_EXTRA_ACCOUNT_IDS
+# (repo variable) to the UF account's internal id. Find it with:
+#   SELECT id, acctnumber, fullname, accttype FROM account WHERE UPPER(fullname) LIKE '%UNDEPOSIT%'
+CASH_ACCT_TYPES = ("Bank",)
+CASH_EXTRA_ACCOUNT_IDS = tuple(
+    int(x) for x in (os.environ.get("CASH_EXTRA_ACCOUNT_IDS") or "").replace(" ", "").split(",") if x
+)
 
 PAYROLL_ACCOUNT_IDS: set[int] = set()
 TOP_CEO_ITEMS = 8            # how many vendors/customers to itemize before "All others"
@@ -102,6 +108,15 @@ def _types_in(types: tuple[str, ...]) -> str:
     return ", ".join(f"'{t}'" for t in types)
 
 
+def _acct_selector(acct_types: tuple[str, ...], extra_ids: tuple[int, ...] = ()) -> str:
+    """SQL predicate: account is one of these types OR one of these explicit internal IDs.
+    Lets us select banks by type and Undeposited Funds by id (its type doesn't match)."""
+    sel = f"a.accttype IN ({_types_in(acct_types)})"
+    if extra_ids:
+        sel = f"({sel} OR a.id IN ({', '.join(str(int(i)) for i in extra_ids)}))"
+    return sel
+
+
 # --------------------------------------------------------------------------------------
 # Dates  (fire after midnight Eastern; report the day that just closed)
 # --------------------------------------------------------------------------------------
@@ -122,12 +137,14 @@ def previous_business_day(d: dt.date) -> dt.date:
 # Queries
 # --------------------------------------------------------------------------------------
 def balances_as_of(d: dt.date, acct_types: tuple[str, ...],
-                   created_on_or_before: dt.date | None = None) -> list[dict]:
+                   created_on_or_before: dt.date | None = None,
+                   extra_account_ids: tuple[int, ...] = ()) -> list[dict]:
     """Posting balance as of trandate <= d.
 
     If created_on_or_before is given, also require the entry to have been CREATED by then --
     i.e. reconstruct the balance as it actually stood at close, excluding anything back-posted
     afterward. Used to synthesize a clean prior baseline on the bootstrap run.
+    extra_account_ids folds in non-type-matched cash accounts (Undeposited Funds).
     """
     created_clause = (
         f"AND TRUNC(t.createddate) <= TO_DATE('{created_on_or_before.isoformat()}', 'YYYY-MM-DD')"
@@ -139,7 +156,7 @@ def balances_as_of(d: dt.date, acct_types: tuple[str, ...],
         FROM   transactionaccountingline tal
         JOIN   transaction t ON t.id = tal.transaction
         JOIN   account a     ON a.id = tal.account
-        WHERE  a.accttype IN ({_types_in(acct_types)})
+        WHERE  {_acct_selector(acct_types, extra_account_ids)}
           AND  tal.posting = 'T'
           AND  t.trandate <= TO_DATE('{d.isoformat()}', 'YYYY-MM-DD')
           {created_clause}
@@ -149,8 +166,10 @@ def balances_as_of(d: dt.date, acct_types: tuple[str, ...],
 
 
 def total_balance(d: dt.date, acct_types: tuple[str, ...],
-                  created_on_or_before: dt.date | None = None) -> float:
-    return sum(float(r["balance"]) for r in balances_as_of(d, acct_types, created_on_or_before))
+                  created_on_or_before: dt.date | None = None,
+                  extra_account_ids: tuple[int, ...] = ()) -> float:
+    return sum(float(r["balance"])
+               for r in balances_as_of(d, acct_types, created_on_or_before, extra_account_ids))
 
 
 def cash_movements(prior: dt.date, report: dt.date, include_created: bool) -> list[dict]:
@@ -173,7 +192,7 @@ def cash_movements(prior: dt.date, report: dt.date, include_created: bool) -> li
         FROM   transactionaccountingline tal
         JOIN   transaction t ON t.id = tal.transaction
         JOIN   account a     ON a.id = tal.account
-        WHERE  a.accttype IN ({_types_in(CASH_ACCT_TYPES)})
+        WHERE  {_acct_selector(CASH_ACCT_TYPES, CASH_EXTRA_ACCOUNT_IDS)}
           AND  tal.posting = 'T'
           AND  t.trandate <= TO_DATE('{report.isoformat()}', 'YYYY-MM-DD')
           AND  ( t.trandate > TO_DATE('{prior.isoformat()}', 'YYYY-MM-DD') {created_clause} )
@@ -476,10 +495,10 @@ def _smtp_send(msg: EmailMessage) -> None:
 def main() -> int:
     try:
         report = resolve_report_date()
-        bal_today = balances_as_of(report, CASH_ACCT_TYPES)
+        bal_today = balances_as_of(report, CASH_ACCT_TYPES, extra_account_ids=CASH_EXTRA_ACCOUNT_IDS)
         if not bal_today:
-            raise RuntimeError("No cash-account balances returned -- check role permissions "
-                               "or that accttype IN ('Bank','UnDepFunds') matches the instance.")
+            raise RuntimeError("No cash-account balances returned -- check role permissions, "
+                               "the Bank account type, and CASH_EXTRA_ACCOUNT_IDS (Undeposited Funds).")
         total_today = sum(float(r["balance"]) for r in bal_today)
 
         state = load_state()
@@ -495,7 +514,8 @@ def main() -> int:
             # back-posts then surface in this run's movements via include_created=True, so the
             # first run is a true roll-forward instead of a naive recompute that would bury them.
             prior_total = total_balance(prior_date, CASH_ACCT_TYPES,
-                                        created_on_or_before=prior_date)
+                                        created_on_or_before=prior_date,
+                                        extra_account_ids=CASH_EXTRA_ACCOUNT_IDS)
             prior_source = "bootstrap"
             include_created = True
 
