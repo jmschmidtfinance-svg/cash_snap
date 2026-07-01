@@ -56,15 +56,16 @@ REPORT_DATE_OVERRIDE = os.environ.get("REPORT_DATE")
 # Sign convention VERIFIED 2026-06-29: cash inflow posts positive. Reconciliation catches errors.
 INFLOW_IS_POSITIVE = True
 
-# The cash perimeter = Bank-type accounts PLUS any explicit account IDs (Undeposited Funds).
-# We select UF by explicit internal ID, NOT by account type: this instance's UF account is not
-# type 'UnDepFunds', so the type filter silently matched nothing and made UF invisible in
-# balances AND movements (deposits then looked like a phantom inflow). Set CASH_EXTRA_ACCOUNT_IDS
-# (repo variable) to the UF account's internal id. Find it with:
-#   SELECT id, acctnumber, fullname, accttype FROM account WHERE UPPER(fullname) LIKE '%UNDEPOSIT%'
+# The cash perimeter = Bank-type accounts PLUS explicit account IDs for Undeposited Funds.
+# UF is selected by explicit internal ID (122), NOT by account type: in this instance UF is a
+# type 'OthCurrAsset' (Other Current Asset) account, so 'UnDepFunds' matched nothing and made
+# UF invisible in balances AND movements (deposits then looked like a phantom inflow). We can't
+# filter on 'OthCurrAsset' either -- that would sweep in prepaids and every other OCA account --
+# so the account id is the only clean selector. Override via the CASH_EXTRA_ACCOUNT_IDS env var
+# (comma-separated) if the id ever changes or more non-bank cash accounts are added.
 CASH_ACCT_TYPES = ("Bank",)
 CASH_EXTRA_ACCOUNT_IDS = tuple(
-    int(x) for x in (os.environ.get("CASH_EXTRA_ACCOUNT_IDS") or "").replace(" ", "").split(",") if x
+    int(x) for x in (os.environ.get("CASH_EXTRA_ACCOUNT_IDS") or "122").replace(" ", "").split(",") if x
 )
 
 PAYROLL_ACCOUNT_IDS: set[int] = set()

@@ -42,12 +42,13 @@ Notes / gotchas about access:
 
 **The cash perimeter is Bank accounts + Undeposited Funds.** We treat "cash" as the combined
 balance of both, because a customer check we've received but not yet deposited is economically
-cash-in-hand. In SuiteQL: `account.accttype IN ('Bank','UnDepFunds')`.
+cash-in-hand. In SuiteQL we select banks by type and UF by explicit id:
+`(account.accttype = 'Bank' OR account.id = 122)` — see the note below for why.
 
 | Internal ID | Acct # | Account name | accttype | Purpose / notes |
 |---|---|---|---|---|
 | `[FILL IN]` | `[FILL IN]` | First Bank | Bank | **Main operating account — nearly all daily bank activity flows here.** |
-| `[FILL IN]` | `[FILL IN]` | Undeposited Funds | UnDepFunds | **Checks received but not yet formally deposited. In the cash perimeter as of v2.** |
+| `122` | `[FILL IN]` | Undeposited Funds | OthCurrAsset | **Checks received but not yet formally deposited. Selected by explicit id (see below). In the cash perimeter as of v2.** |
 | `[FILL IN]` | `[FILL IN]` | Brokerage Account | Bank | Effectively static (~$8.4k on 2026-06-29). |
 | `[FILL IN]` | `[FILL IN]` | First Bank of the Lake | Bank | Effectively static (~$302). |
 | `[FILL IN]` | `[FILL IN]` | Petty Cash | Bank | Effectively static (~$212). |
@@ -55,11 +56,13 @@ cash-in-hand. In SuiteQL: `account.accttype IN ('Bank','UnDepFunds')`.
 Decisions to record:
 - Only **First Bank** and **Undeposited Funds** move day to day; the other three carry static
   balances. The snap still reports all of them so any change surfaces.
-- **Undeposited Funds classifies as an Other Current Asset on the balance sheet, but has its
-  own NetSuite account type `UnDepFunds`.** `[VERIFY the type code matches the instance.]` If
-  ours is instead a *custom* Other Current Asset account, `accttype IN ('Bank','UnDepFunds')`
-  will miss it and we must switch to an explicit account-ID list. The reconciliation check
-  (§9) will flag this on the first run if the balance looks wrong.
+- **Undeposited Funds is account id 122, type `OthCurrAsset` (Other Current Asset) — NOT the
+  built-in `UnDepFunds` type** (confirmed 2026-07-01). This bit us on the first run: the
+  `accttype IN ('Bank','UnDepFunds')` filter matched no UF account, so UF was invisible in
+  balances AND movements and deposits showed up as a phantom ~$973k inflow. We select UF by
+  explicit id (`CASH_EXTRA_ACCOUNT_IDS`, default `122`). We deliberately do **not** filter on
+  `OthCurrAsset` — that would sweep in prepaids and every other Other Current Asset account.
+
 
 ---
 
@@ -126,7 +129,7 @@ SELECT a.id AS account_id, a.acctnumber, a.fullname, a.accttype,
 FROM   transactionaccountingline tal
 JOIN   transaction t ON t.id = tal.transaction
 JOIN   account a     ON a.id = tal.account
-WHERE  a.accttype IN ('Bank','UnDepFunds')
+WHERE  (a.accttype = 'Bank' OR a.id = 122)          -- banks by type, Undeposited Funds by id
   AND  tal.posting = 'T'
   AND  t.trandate <= TO_DATE(:as_of_date, 'YYYY-MM-DD')
   -- AND TRUNC(t.createddate) <= TO_DATE(:created_cutoff, 'YYYY-MM-DD')  -- bootstrap only
@@ -145,7 +148,7 @@ SELECT t.id AS tran_id, t.tranid, t.trandate, t.createddate,
 FROM   transactionaccountingline tal
 JOIN   transaction t ON t.id = tal.transaction
 JOIN   account a     ON a.id = tal.account
-WHERE  a.accttype IN ('Bank','UnDepFunds')
+WHERE  (a.accttype = 'Bank' OR a.id = 122)          -- banks by type, Undeposited Funds by id
   AND  tal.posting = 'T'
   AND  t.trandate <= TO_DATE(:report_date, 'YYYY-MM-DD')
   AND  ( t.trandate > TO_DATE(:prior_date, 'YYYY-MM-DD')
@@ -305,6 +308,12 @@ never categorizes, sums, or reconciles. (Validated end-to-end 2026-06-29.)
 - **Cash perimeter = Bank + Undeposited Funds (v2).** Only First Bank and UF are transactional;
   Brokerage, First Bank of the Lake, and Petty Cash are effectively static. A Deposit is a
   UF→Bank internal move and nets to zero.
+- **Undeposited Funds is id 122, type `OthCurrAsset` — not `UnDepFunds` (confirmed 2026-07-01).**
+  The first live run (report_date 6/30) proved this: the `('Bank','UnDepFunds')` type filter
+  matched no UF account, so UF was absent from balances AND movements, the ~4 payments into UF
+  on 6/29 were missed, and the day's deposits surfaced as a phantom +$973k "Internal transfer"
+  (only the First Bank leg was visible). Fix: select UF by explicit id (default 122), keep banks
+  by type. Do not filter on `OthCurrAsset` — it would pull in prepaids and other OCA accounts.
 - **Bank-interest journals:** small `Journal` entries to First Bank land in
   `Other / unclassified` and are almost certainly bank interest — see §7 decision pending.
 - `[FILL IN — month-end timing effects, holiday calendars, when deposits clear, etc.]`
@@ -317,4 +326,5 @@ never categorizes, sums, or reconciles. (Validated end-to-end 2026-06-29.)
 |---|---|---|
 | 2026-06-29 | Initial skeleton + pipeline wired (single subsidiary, GitHub Actions, email delivery). | |
 | 2026-06-29 | First successful end-to-end run. Verified sign convention (inflow positive); marked §6a/6b canonical; populated cash accounts and transaction types; recorded dedicated-API-role fix for `EntityOrRoleDisabled`; set threshold = 10000; noted Markdown-in-plain-text email issue and bank-interest-journal decision. | |
-| 2026-06-30 | **v2.** Added Undeposited Funds to the cash perimeter (`Bank`+`UnDepFunds`); reclassified Deposit as an internal UF→Bank transfer; implemented stateful roll-forward reconciliation against the last reported balance with a committed `state/cash_state.json` audit ledger; bootstrap now reconstructs a clean prior and surfaces back-posts; moved cron to ~00:30 ET; split output into CFO VIEW (full-decimal audit) + CEO OUTPUT (rounded text-message style); added §6c AR/AP totals. Open TODOs: define unpaid-bills (overdue vs open); map cash-in to project codes; verify `createddate` column and `UnDepFunds` account type on first run. | |
+| 2026-06-30 | **v2.** Added Undeposited Funds to the cash perimeter (`Bank`+`UnDepFunds`); reclassified Deposit as an internal UF→Bank transfer; implemented stateful roll-forward reconciliation against the last reported balance with a committed `state/cash_state.json` audit ledger; bootstrap now reconstructs a clean prior and surfaces back-posts; moved cron to ~00:30 ET; split output into CFO VIEW (full-decimal audit) + CEO OUTPUT (rounded text-message style); added §6c AR/AP totals. Open TODOs: define unpaid-bills (overdue vs open); map cash-in to project codes; verify `createddate` column. | |
+| 2026-07-01 | First live run (6/30) exposed the UF bug: Undeposited Funds is id 122 / type `OthCurrAsset`, not `UnDepFunds`, so the type filter matched nothing and UF was invisible everywhere (phantom +$973k "Internal transfer"). Fix: select banks by type + UF by explicit id (default 122, `CASH_EXTRA_ACCOUNT_IDS` overrides); added an optional `report_date` workflow_dispatch input. Requires deleting the stale Bank-only `state/cash_state.json` so the next run re-bootstraps with UF included. | |
