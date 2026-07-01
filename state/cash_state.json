@@ -1,10 +1,14 @@
 {
   "report_date": "2026-06-30",
-  "total_cash": 4101444.41,
+  "total_cash": 4100729.41,
   "balances": {
+    "122": {
+      "name": "Undeposited Funds",
+      "balance": 0.0
+    },
     "223": {
       "name": "First Bank",
-      "balance": 4092495.72
+      "balance": 4091785.72
     },
     "224": {
       "name": "Petty Cash",
@@ -12,7 +16,7 @@
     },
     "311": {
       "name": "First Bank of the Lake",
-      "balance": 302.45
+      "balance": 297.45
     },
     "312": {
       "name": "Brokerage Account",
