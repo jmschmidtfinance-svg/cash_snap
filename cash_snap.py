@@ -226,6 +226,9 @@ def cash_in_by_project(prior: dt.date, report: dt.date, include_created: bool) -
     )
     sql = f"""
         SELECT pay.tranid         AS payment_no,
+               pay.trandate       AS payment_date,
+               BUILTIN.DF(pay.entity) AS customer,
+               inv.tranid         AS invoice_no,
                link.foreignamount AS applied_amt,
                proj.entityid      AS project_num,
                proj.companyname   AS project_name,
@@ -514,6 +517,89 @@ def movements_csv(movements: list[dict]) -> str:
     return buf.getvalue()
 
 
+def payments_workbook(proj_rows: list[dict]) -> bytes:
+    """Excel of the day's customer payments: a Detail sheet (one row per payment->invoice, with
+    customer and job), plus By-job and By-customer summaries. Amounts are the applied amount from
+    the payment->invoice link. Values are computed here (deterministic); the file carries no
+    formulas since the CI runner has no spreadsheet engine to recalculate them."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    MONEY = "#,##0.00"
+    HDR_FONT = Font(name="Arial", bold=True, color="FFFFFF")
+    HDR_FILL = PatternFill("solid", fgColor="1F4E78")
+    BASE = Font(name="Arial")
+    BOLD = Font(name="Arial", bold=True)
+    CENTER = Alignment(horizontal="center")
+    label = {CLASS_PRODUCTION: "Production", CLASS_SERVICE: "Service"}
+
+    def amt(r):
+        return round(float(r.get("applied_amt") or 0), 2)
+
+    def style_sheet(ws, ncols, widths, money_cols, total_row):
+        for c in range(1, ncols + 1):
+            cell = ws.cell(1, c)
+            cell.font, cell.fill, cell.alignment = HDR_FONT, HDR_FILL, CENTER
+        for r in range(2, ws.max_row + 1):
+            for c in range(1, ncols + 1):
+                ws.cell(r, c).font = BOLD if r == total_row else BASE
+            for c in money_cols:
+                ws.cell(r, c).number_format = MONEY
+        for i, wdt in enumerate(widths, 1):
+            ws.column_dimensions[chr(64 + i)].width = wdt
+        ws.freeze_panes = "A2"
+
+    wb = Workbook()
+
+    # Sheet 1 -- Detail (payment x invoice, with customer + job)
+    ws = wb.active
+    ws.title = "Detail"
+    ws.append(["Payment #", "Date", "Customer", "Invoice #", "Job #", "Job name", "Class", "Amount"])
+    rows = sorted(proj_rows, key=lambda r: (str(r.get("customer") or ""),
+                                            str(r.get("payment_no") or ""),
+                                            str(r.get("invoice_no") or "")))
+    total = 0.0
+    for r in rows:
+        a = amt(r); total += a
+        ws.append([r.get("payment_no"), str(r.get("payment_date") or "")[:10], r.get("customer"),
+                   r.get("invoice_no"), r.get("project_num") or "", r.get("project_name") or "",
+                   label.get(r.get("class_id"), ""), a])
+    ws.append(["", "", "", "", "", "", "Total", round(total, 2)])
+    style_sheet(ws, 8, [15, 12, 34, 16, 12, 30, 12, 16], (8,), ws.max_row)
+
+    # Sheet 2 -- By job (Production itemized; everything else lumped as Service)
+    prod: dict[tuple, float] = defaultdict(float)
+    service = 0.0
+    for r in rows:
+        if r.get("class_id") == CLASS_PRODUCTION and r.get("project_num"):
+            prod[(r["project_num"], r.get("project_name") or r["project_num"])] += amt(r)
+        else:
+            service += amt(r)
+    ws2 = wb.create_sheet("By job")
+    ws2.append(["Job #", "Job name", "Amount"])
+    for (num, name), v in sorted(prod.items(), key=lambda kv: kv[1], reverse=True):
+        ws2.append([num, name, round(v, 2)])
+    if round(service, 2):
+        ws2.append(["", "Service (all non-Production)", round(service, 2)])
+    ws2.append(["", "Total", round(total, 2)])
+    style_sheet(ws2, 3, [14, 40, 16], (3,), ws2.max_row)
+
+    # Sheet 3 -- By customer
+    bycust: dict[str, float] = defaultdict(float)
+    for r in rows:
+        bycust[r.get("customer") or "(unknown)"] += amt(r)
+    ws3 = wb.create_sheet("By customer")
+    ws3.append(["Customer", "Amount"])
+    for name, v in sorted(bycust.items(), key=lambda kv: kv[1], reverse=True):
+        ws3.append([name, round(v, 2)])
+    ws3.append(["Total", round(total, 2)])
+    style_sheet(ws3, 2, [40, 16], (2,), ws3.max_row)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 def cfo_detail_block(summary: dict) -> str:
     """Deterministic long-form, full values with cents -- the audit view."""
     lines = [f"Cash today ({summary['report_date']}): {summary['total_cash_today']:,.2f}"]
@@ -546,7 +632,8 @@ def cfo_detail_block(summary: dict) -> str:
     return "\n".join(lines)
 
 
-def send_email(summary: dict, cfo_narrative: str, ceo_block: str, movements: list[dict]) -> None:
+def send_email(summary: dict, cfo_narrative: str, ceo_block: str, movements: list[dict],
+               proj_rows: list[dict] | None = None) -> None:
     msg = EmailMessage()
     msg["Subject"] = f"Cash snap -- {summary['report_date']}"
     msg["From"], msg["To"] = MAIL_FROM, MAIL_TO
@@ -557,7 +644,8 @@ def send_email(summary: dict, cfo_narrative: str, ceo_block: str, movements: lis
         f"{cfo_detail_block(summary)}\n\n\n"
         "===== CEO OUTPUT =====\n\n"
         f"{ceo_block}\n\n"
-        "(full numbers in the attached JSON; line detail in the CSV)\n"
+        "(full numbers in the attached JSON; cash line detail in the CSV; "
+        "payments received by invoice/job/customer in the Excel)\n"
     )
     msg.set_content(body)
     msg.add_attachment(json.dumps(summary, indent=2, default=str).encode(),
@@ -565,6 +653,11 @@ def send_email(summary: dict, cfo_narrative: str, ceo_block: str, movements: lis
                        filename=f"cash_snap_{summary['report_date']}.json")
     msg.add_attachment(movements_csv(movements).encode(), maintype="text", subtype="csv",
                        filename=f"cash_movements_{summary['report_date']}.csv")
+    if proj_rows is not None:
+        msg.add_attachment(
+            payments_workbook(proj_rows), maintype="application",
+            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=f"payments_received_{summary['report_date']}.xlsx")
     _smtp_send(msg)
 
 
@@ -631,7 +724,7 @@ def main() -> int:
                                 bal_today, movements, ar_total, ap_total,
                                 proj_rows=proj_rows, unpaid=unpaid)
         cfo_narrative, ceo_block = write_sections(summary)
-        send_email(summary, cfo_narrative, ceo_block, movements)
+        send_email(summary, cfo_narrative, ceo_block, movements, proj_rows=proj_rows)
 
         # Log only after a successful send; the workflow commits this file.
         save_state(report, total_today, bal_today)
