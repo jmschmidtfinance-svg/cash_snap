@@ -81,11 +81,19 @@ Decisions to record:
 
 | Field/segment | Script ID / column | Where it appears | Meaning | Used in cash snap? |
 |---|---|---|---|---|
-| `[FILL IN]` | `custbody_…` / `custcol_…` | header / line | | |
+| Job class | `custentity_r_it_class` | project (`job`) record | **1 = Production, 2 = Service** (matches the Class master, §3). Distribution: 354 Production, 11,925 Service, 2 null. This is the authoritative Production/Service flag. | Yes — cash-in split |
+| GL project | `custcol_r_it_reporting_project` | invoice **line** | The RABB-IT reporting project (a `job` id) on the line. Populated on Production invoices; **null on Service** (fine — those fall through to Service). NOT the header customer. | Yes — cash-in split |
+| Procore project # | `custentity_r_it_pc_project_number` | project (`job`) record | RABB-IT's Procore project number (usually equals `entityid`). | Reference |
 
-Known gap: **payments are not yet joined to job/project codes** (e.g. "1478ILM Galleria").
-The CEO block wants cash-in itemized by project; until we can map a payment → its applied
-invoices → their job/project, we itemize cash-in by customer as a stand-in. See §8.
+**Project = the native `job` record** (NetSuite renamed Jobs → Projects in the UI but kept the
+SuiteQL name `job`). Job # = `job.entityid` (e.g. "1471CLT"); Job name = `job.companyname`
+(e.g. "Stanly County EOC"). The invoice **header** `entity` is the GC **customer** (Oscar Renda,
+Barnhill, Easterseals), NOT the project — do not use it for project attribution.
+
+**Cash-in-by-project (resolved 2026-07-01).** Payment → applied invoice(s) → GL project → project
+class. Production is itemized by project #/name; Service (Service-class or null GL project) is a
+single total. See §6d for the query and §7 for the rule. (Previously we itemized by customer as a
+stand-in; that is superseded.)
 
 ---
 
@@ -170,6 +178,47 @@ WHERE  a.accttype = :type            -- 'AcctRec' for AR, 'AcctPay' for AP
   AND  t.trandate <= TO_DATE(:report_date, 'YYYY-MM-DD')
 ```
 
+### 6d. Cash-in by project (Production itemized / Service lumped)  ✅ verified 2026-07-01
+For each customer payment in the roll-forward window, split its applied amount across the invoices
+it paid (`PreviousTransactionLineLink.foreignamount` — NOTE the applied amount is `foreignamount`,
+not `amount`), resolve each invoice's **GL project** (line field `custcol_r_it_reporting_project`,
+taken as one project per invoice via `MIN`), and read the project's class. One row per
+(payment, invoice); the day's rows sum to the AR-collections inflow (verified: 6/30 = $64,160.57).
+
+```sql
+SELECT pay.tranid         AS payment_no,
+       link.foreignamount AS applied_amt,
+       proj.entityid      AS project_num,
+       proj.companyname   AS project_name,
+       proj.custentity_r_it_class AS class_id      -- 1 Production, 2 Service
+FROM   transaction pay
+JOIN   PreviousTransactionLineLink link
+         ON link.nextdoc = pay.id AND link.previoustype = 'CustInvc'
+JOIN   transaction inv ON inv.id = link.previousdoc
+LEFT JOIN job proj ON proj.id = (
+         SELECT MIN(tl.custcol_r_it_reporting_project) FROM transactionline tl
+         WHERE  tl.transaction = inv.id AND tl.custcol_r_it_reporting_project IS NOT NULL)
+WHERE  pay.type = 'CustPymt'
+  AND  pay.trandate <= TO_DATE(:report_date, 'YYYY-MM-DD')
+  AND  ( pay.trandate > TO_DATE(:prior_date, 'YYYY-MM-DD')
+         OR TRUNC(pay.createddate) > TO_DATE(:prior_date, 'YYYY-MM-DD') )
+```
+Code then groups class 1 (Production) by project #/name; **Service = the residual** against the
+AR inflow total, so Production + Service always ties. `PreviousTransactionLineLink` link fields:
+`nextdoc`=payment, `previousdoc`=invoice, `previoustype`='CustInvc', `foreignamount`=applied amount.
+
+### 6e. Overdue unpaid bills  ✅ verified 2026-07-01
+Open vendor bills past their due date, at remaining (unpaid) balance. Overdue = `duedate` strictly
+before the report date; open = `foreignamountunpaid > 0` (header field). 6/30: $70,140.53, 23 bills.
+
+```sql
+SELECT COUNT(*) AS n, NVL(SUM(t.foreignamountunpaid), 0) AS overdue_total
+FROM   transaction t
+WHERE  t.type = 'VendBill'
+  AND  t.duedate < TO_DATE(:report_date, 'YYYY-MM-DD')
+  AND  t.foreignamountunpaid > 0
+```
+
 ### Sign convention  ✅ VERIFIED 2026-06-29
 Cash **increase** posts as positive `tal.amount` (debit-positive). Inflows positive, outflows
 negative. The first run reconciled to the penny with `INFLOW_IS_POSITIVE = True`.
@@ -197,6 +246,10 @@ Each posting line hitting a cash account is assigned to exactly one bucket. Firs
 | 99 | (fallback) | `Other / unclassified` | Flag for review if material |
 
 Special rules / exclusions:
+- **AR collections sub-split by project (§6d).** Within the `AR collections` bucket, each
+  customer payment is attributed to the project(s) it collected against: **Production** (project
+  class 1) itemized by project #/name; everything else (Service class, or no GL project) summed as
+  **Service**, computed as the residual so Production + Service ties to the AR inflow.
 - **UF ↔ Bank deposits net to zero** across the cash perimeter (both legs are cash accounts),
   so the reconciliation handles them automatically; bucketing them as `Internal transfer`
   keeps them out of the driver explanation.
@@ -232,19 +285,22 @@ The email has two sections:
 ```
 6/30
 Cash: $4.1m
-AR: $5.6m
+AR: $5.7m
 AP: $2.6m
-Unpaid bills: $19k
+Overdue bills: $70k (23)
 
-Cash in: $882k
-<itemized>
-Cash out: $333k
+Cash in: $64k
+Production
+  Stanly County EOC (1471CLT) - $58k
+Service - $6k
+Cash out: $61k
 <itemized, top ~8 then "All others $X">
 ```
 - **Cash** = Bank + Undeposited Funds. **AR** = AcctRec total. **AP** = AcctPay total (abs).
-- **Unpaid bills** — `[TODO]` placeholder; overdue-vs-open definition not yet nailed down.
-- **Cash in** — itemized by **customer** as a stand-in until payments can be mapped to project
-  codes (see §4). **Cash out** — by vendor, top ~8 then an "All others" rollup.
+- **Overdue bills** — open vendor bills past due date (§6e), shown as `$total (count)`. The summary
+  carries `unpaid_bills = {basis:"overdue", count, total}`; if null, render `[tbd]`.
+- **Cash in** — split by project (§6d/§7): **Production** itemized as `Name (project#) - $Xk`;
+  **Service** a single total. **Cash out** — by vendor, top ~8 then an "All others" rollup.
 
 Anomaly flags: over-threshold items/buckets, anything in `Other / unclassified`, negative
 balances, large single transactions, reconciliation mismatch, and the bootstrap notice.
@@ -328,3 +384,4 @@ never categorizes, sums, or reconciles. (Validated end-to-end 2026-06-29.)
 | 2026-06-29 | First successful end-to-end run. Verified sign convention (inflow positive); marked §6a/6b canonical; populated cash accounts and transaction types; recorded dedicated-API-role fix for `EntityOrRoleDisabled`; set threshold = 10000; noted Markdown-in-plain-text email issue and bank-interest-journal decision. | |
 | 2026-06-30 | **v2.** Added Undeposited Funds to the cash perimeter (`Bank`+`UnDepFunds`); reclassified Deposit as an internal UF→Bank transfer; implemented stateful roll-forward reconciliation against the last reported balance with a committed `state/cash_state.json` audit ledger; bootstrap now reconstructs a clean prior and surfaces back-posts; moved cron to ~00:30 ET; split output into CFO VIEW (full-decimal audit) + CEO OUTPUT (rounded text-message style); added §6c AR/AP totals. Open TODOs: define unpaid-bills (overdue vs open); map cash-in to project codes; verify `createddate` column. | |
 | 2026-07-01 | First live run (6/30) exposed the UF bug: Undeposited Funds is id 122 / type `OthCurrAsset`, not `UnDepFunds`, so the type filter matched nothing and UF was invisible everywhere (phantom +$973k "Internal transfer"). Fix: select banks by type + UF by explicit id (default 122, `CASH_EXTRA_ACCOUNT_IDS` overrides); added an optional `report_date` workflow_dispatch input. Requires deleting the stale Bank-only `state/cash_state.json` so the next run re-bootstraps with UF included. | |
+| 2026-07-01 | **Cash-in by project + overdue bills.** Verified against live NetSuite: project = `job` record (# = entityid, name = companyname); GL project on invoice line = `custcol_r_it_reporting_project`; class = `custentity_r_it_class` (1 Production / 2 Service); payment→invoice link = `PreviousTransactionLineLink` (`foreignamount` = applied amount). Cash-in now splits Production (itemized by project) vs Service (residual); ties to AR inflow ($64,160.57 on 6/30). Overdue unpaid bills (§6e): `VendBill`, `duedate < report`, `foreignamountunpaid > 0` ($70,140.53 / 23 bills on 6/30). New code: `cash_in_by_project()`, `overdue_bills()`, `cash_in_project_split()`; CFO/CEO blocks and prompt updated. | |

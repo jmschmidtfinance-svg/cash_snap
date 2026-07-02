@@ -72,6 +72,16 @@ PAYROLL_ACCOUNT_IDS: set[int] = set()
 TOP_CEO_ITEMS = 8            # how many vendors/customers to itemize before "All others"
 EPSILON = 0.01
 
+# Project (called "job" internally in NetSuite -- Jobs were renamed Projects in the UI but the
+# SuiteQL record kept the name). The GL project on an invoice line is the RABB-IT column
+# custcol_r_it_reporting_project (populated on Production invoices; null on Service, which is fine
+# -- those fall through to the Service bucket). The project record's Production/Service flag is the
+# custom field custentity_r_it_class, matching the Class master: 1 = Production, 2 = Service.
+PROJECT_GL_FIELD    = "custcol_r_it_reporting_project"
+PROJECT_CLASS_FIELD = "custentity_r_it_class"
+CLASS_PRODUCTION    = 1
+CLASS_SERVICE       = 2
+
 
 # --------------------------------------------------------------------------------------
 # SuiteQL client
@@ -202,9 +212,51 @@ def cash_movements(prior: dt.date, report: dt.date, include_created: bool) -> li
     return run_suiteql(sql)
 
 
-# --------------------------------------------------------------------------------------
-# State (roll-forward anchor + audit ledger)
-# --------------------------------------------------------------------------------------
+def cash_in_by_project(prior: dt.date, report: dt.date, include_created: bool) -> list[dict]:
+    """Customer payments in the roll-forward window, split to the project they collected against.
+
+    Each payment -> applied invoice(s) via PreviousTransactionLineLink (foreignamount = the amount
+    applied to that invoice); each invoice -> its GL project (the line-level reporting-project field,
+    taken as one project per invoice) -> the project record + its Production/Service class. Same
+    window as cash_movements, so the attributed total ties to the AR-collections inflow. One row per
+    (payment, invoice) link; a payment spanning multiple invoices/projects yields multiple rows."""
+    created_clause = (
+        f"OR TRUNC(pay.createddate) > TO_DATE('{prior.isoformat()}', 'YYYY-MM-DD')"
+        if include_created else ""
+    )
+    sql = f"""
+        SELECT pay.tranid         AS payment_no,
+               link.foreignamount AS applied_amt,
+               proj.entityid      AS project_num,
+               proj.companyname   AS project_name,
+               proj.{PROJECT_CLASS_FIELD} AS class_id
+        FROM   transaction pay
+        JOIN   PreviousTransactionLineLink link
+                 ON link.nextdoc = pay.id AND link.previoustype = 'CustInvc'
+        JOIN   transaction inv ON inv.id = link.previousdoc
+        LEFT JOIN job proj ON proj.id = (
+                 SELECT MIN(tl.{PROJECT_GL_FIELD}) FROM transactionline tl
+                 WHERE  tl.transaction = inv.id AND tl.{PROJECT_GL_FIELD} IS NOT NULL)
+        WHERE  pay.type = 'CustPymt'
+          AND  pay.trandate <= TO_DATE('{report.isoformat()}', 'YYYY-MM-DD')
+          AND  ( pay.trandate > TO_DATE('{prior.isoformat()}', 'YYYY-MM-DD') {created_clause} )
+    """
+    return run_suiteql(sql)
+
+
+def overdue_bills(report: dt.date) -> dict:
+    """Open vendor bills past their due date, summed at remaining (unpaid) balance."""
+    sql = f"""
+        SELECT COUNT(*) AS n, NVL(SUM(t.foreignamountunpaid), 0) AS overdue_total
+        FROM   transaction t
+        WHERE  t.type = 'VendBill'
+          AND  t.duedate < TO_DATE('{report.isoformat()}', 'YYYY-MM-DD')
+          AND  t.foreignamountunpaid > 0
+    """
+    rows = run_suiteql(sql)
+    r = rows[0] if rows else {}
+    return {"basis": "overdue", "count": int(r.get("n") or 0),
+            "total": round(float(r.get("overdue_total") or 0), 2)}
 def load_state() -> dict | None:
     try:
         with open(STATE_PATH, encoding="utf-8") as f:
@@ -266,9 +318,31 @@ def _itemize(rows: list[dict], inflow: bool) -> list[dict]:
     return items
 
 
+def cash_in_project_split(proj_rows: list[dict], cash_in_total: float) -> dict:
+    """Deterministic split of the day's collections: Production itemized by project (#/name),
+    everything else (Service-class or no GL project) summed as Service. Service is the residual
+    against the authoritative AR inflow total, so Production + Service always ties to cash_in."""
+    prod: dict[tuple, float] = defaultdict(float)
+    attributed = 0.0
+    for r in proj_rows:
+        amt = round(float(r.get("applied_amt") or 0), 2)
+        attributed += amt
+        num = r.get("project_num")
+        if r.get("class_id") == CLASS_PRODUCTION and num:
+            prod[(num, r.get("project_name") or num)] += amt
+    production = [{"project_num": k[0], "project_name": k[1], "amount": round(v, 2)}
+                  for k, v in prod.items()]
+    production.sort(key=lambda x: abs(x["amount"]), reverse=True)
+    prod_sum = round(sum(p["amount"] for p in production), 2)
+    return {"production": production,
+            "service": round(cash_in_total - prod_sum, 2),   # residual -> everything non-Production
+            "attributed_total": round(attributed, 2)}
+
+
 def build_summary(report: dt.date, prior_date: dt.date, prior_total: float,
                   prior_source: str, bal_today: list[dict], movements: list[dict],
-                  ar_total: float, ap_total: float) -> dict:
+                  ar_total: float, ap_total: float,
+                  proj_rows: list[dict] | None = None, unpaid: dict | None = None) -> dict:
     by_acct = {r["account_id"]: float(r["balance"]) for r in bal_today}
     names = {r["account_id"]: r["fullname"] for r in bal_today}
     total_today = sum(by_acct.values())
@@ -298,6 +372,7 @@ def build_summary(report: dt.date, prior_date: dt.date, prior_total: float,
     cash_in_items = _itemize(movements, inflow=True)
     cash_out_all = _itemize(movements, inflow=False)
     cash_in_total = round(sum(i["amount"] for i in cash_in_items), 2)
+    proj_split = cash_in_project_split(proj_rows or [], cash_in_total)
     cash_out_total = round(sum(i["amount"] for i in cash_out_all), 2)
     cash_out_items = cash_out_all[:TOP_CEO_ITEMS]
     others = cash_out_all[TOP_CEO_ITEMS:]
@@ -326,6 +401,10 @@ def build_summary(report: dt.date, prior_date: dt.date, prior_total: float,
     for aid, bal in by_acct.items():
         if bal < 0:
             flags.append(f"Negative balance: {names.get(aid, aid)} at {bal:,.2f}")
+    if proj_rows is not None and abs(proj_split["attributed_total"] - cash_in_total) > max(EPSILON, 0.005 * abs(cash_in_total)):
+        flags.append(f"Cash-in-by-project attribution {proj_split['attributed_total']:,.2f} differs "
+                     f"from AR inflow {cash_in_total:,.2f}; residual folded into Service -- check for "
+                     f"payments not applied to invoices, or non-customer inflows.")
 
     return {
         "report_date": report.isoformat(),
@@ -337,14 +416,16 @@ def build_summary(report: dt.date, prior_date: dt.date, prior_total: float,
         "net_change": round(net_change, 2),
         "ar_total": round(ar_total, 2),
         "ap_total": round(ap_total, 2),
-        "unpaid_bills": None,   # TODO: define overdue-vs-open and add query (KB sec.8)
+        "unpaid_bills": unpaid,   # {"basis":"overdue","count":N,"total":X} or None
         "account_balances": [{"account": names.get(aid, aid), "balance": round(by_acct[aid], 2),
                               "type": next((r["accttype"] for r in bal_today
                                             if r["account_id"] == aid), "")}
                              for aid in sorted(by_acct, key=lambda a: str(names.get(a, a)))],
         "by_bucket": bucket_list,
         "top_movers": top_movers,
-        "cash_in": {"total": cash_in_total, "items": cash_in_items},
+        "cash_in": {"total": cash_in_total,
+                    "production": proj_split["production"],
+                    "service": proj_split["service"]},
         "cash_out": {"total": cash_out_total, "items": cash_out_items,
                      "all_others": cash_out_other},
         "reconciles": recon_ok,
@@ -359,20 +440,19 @@ CEO_STYLE_EXAMPLE = """\
 6/30
 
 Cash: $4.1m
-AR: $5.6m
+AR: $5.7m
 AP: $2.6m
-Unpaid bills: $19k
+Overdue bills: $70k (23)
 
-Cash in: $882k
-W.M. Jordan - $537k
-Mayfair - $262k
-Service - $17k
+Cash in: $64k
+Production
+  Stanly County EOC (1471CLT) - $58k
+Service - $6k
 
-Cash out: $333k
-QXO - $96k
-CMP - $49k
-Superior - $37k
-All others $48k
+Cash out: $61k
+Wild Edge Woodcraft - $53k
+MBFS - $2k
+All others $6k
 """
 
 
@@ -391,13 +471,20 @@ def write_sections(summary: dict) -> tuple[str, str]:
         "sections separated by the delimiters shown, nothing before or after:\n"
         "<<<CFO>>>\n"
         "A precise CFO brief. One-line headline, then the drivers (by_bucket and top_movers), "
-        "then every item in 'flags'. Keep full dollar figures with cents. If 'reconciles' is "
-        "false, lead with that and call the numbers provisional.\n"
+        "then note collections (cash_in: the Production projects and the Service total) and "
+        "overdue unpaid bills (unpaid_bills), then every item in 'flags'. Keep full dollar figures "
+        "with cents. If 'reconciles' is false, lead with that and call the numbers provisional.\n"
         "<<<CEO>>>\n"
-        "A short text-message-style summary matching this exact format and rounding "
-        "(round to $k/$m, abbreviate vendor/customer names sensibly, use 'All others' for the "
-        "cash_out all_others amount; if unpaid_bills is null, write 'Unpaid bills: [tbd]'):\n"
-        f"{CEO_STYLE_EXAMPLE}"
+        "A short text-message-style summary matching the example's format and rounding "
+        "(round to $k/$m, abbreviate vendor/customer names sensibly). Rules:\n"
+        "- Header lines: Cash, AR, AP, then Overdue bills. unpaid_bills is an object "
+        "{basis, count, total}; render 'Overdue bills: $Xk (N)' from total and count. If it is null, "
+        "write 'Overdue bills: [tbd]'.\n"
+        "- Cash in: use cash_in.total for the headline amount. If cash_in.production is non-empty, "
+        "add a 'Production' label then one line per project as 'ProjectName (project_num) - $Xk'; "
+        "omit the label and lines if it is empty. Then 'Service - $Xk' from cash_in.service.\n"
+        "- Cash out: itemize cash_out.items, then 'All others $Xk' for cash_out.all_others.\n"
+        f"Format example:\n{CEO_STYLE_EXAMPLE}"
     )
     user = (f"KNOWLEDGE BASE:\n{kb}\n\nTODAY'S COMPUTED SUMMARY (JSON):\n"
             f"{json.dumps(summary, indent=2, default=str)}")
@@ -440,6 +527,20 @@ def cfo_detail_block(summary: dict) -> str:
     lines.append("By bucket:")
     for b in summary["by_bucket"]:
         lines.append(f"    {b['bucket']:<22} {b['net']:>16,.2f}")
+    lines.append("")
+    ci = summary["cash_in"]
+    lines.append(f"Cash in by project: {ci['total']:,.2f}")
+    if ci.get("production"):
+        lines.append("    Production:")
+        for p in ci["production"]:
+            lines.append(f"        {p['project_num']:<10} {(p['project_name'] or ''):<28} "
+                         f"{p['amount']:>14,.2f}")
+    lines.append(f"    {'Service:':<39}{ci['service']:>14,.2f}")
+    ub = summary.get("unpaid_bills")
+    if ub:
+        lines.append("")
+        lines.append(f"Overdue unpaid bills (due before {summary['report_date']}): "
+                     f"{ub['total']:,.2f}  ({ub['count']} bills)")
     lines.append("")
     lines.append(f"Reconciles (roll-forward): {summary['reconciles']}")
     return "\n".join(lines)
@@ -523,9 +624,12 @@ def main() -> int:
         movements = cash_movements(prior_date, report, include_created)
         ar_total = abs(total_balance(report, ("AcctRec",)))
         ap_total = abs(total_balance(report, ("AcctPay",)))
+        proj_rows = cash_in_by_project(prior_date, report, include_created)
+        unpaid = overdue_bills(report)
 
         summary = build_summary(report, prior_date, prior_total, prior_source,
-                                bal_today, movements, ar_total, ap_total)
+                                bal_today, movements, ar_total, ap_total,
+                                proj_rows=proj_rows, unpaid=unpaid)
         cfo_narrative, ceo_block = write_sections(summary)
         send_email(summary, cfo_narrative, ceo_block, movements)
 
