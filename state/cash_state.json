@@ -1,6 +1,6 @@
 {
-  "report_date": "2026-07-03",
-  "total_cash": 3517251.48,
+  "report_date": "2026-07-04",
+  "total_cash": 3512394.67,
   "balances": {
     "122": {
       "name": "Undeposited Funds",
@@ -8,7 +8,7 @@
     },
     "223": {
       "name": "First Bank",
-      "balance": 3508307.79
+      "balance": 3503450.98
     },
     "224": {
       "name": "Petty Cash",
