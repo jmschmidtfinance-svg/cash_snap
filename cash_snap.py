@@ -2,8 +2,9 @@
 """
 Daily cash snap pipeline (single subsidiary) -- v2.
 
-Cash perimeter = Bank accounts + Undeposited Funds (accttype IN ('Bank','UnDepFunds')).
-"Cash" is the combined balance; a Deposit (UF -> Bank) is internal and nets to zero.
+Cash perimeter = an explicit allowlist of account internal IDs (CASH_ACCOUNT_IDS; default
+First Bank 223 + Undeposited Funds 122). "Cash" is the combined balance; a Deposit (UF -> Bank)
+is internal and nets to zero.
 
 Reconciliation is a stateful ROLL-FORWARD:
   last *reported* balance (from state file)  +  captured movements  ==  today's computed balance
@@ -56,16 +57,18 @@ REPORT_DATE_OVERRIDE = os.environ.get("REPORT_DATE")
 # Sign convention VERIFIED 2026-06-29: cash inflow posts positive. Reconciliation catches errors.
 INFLOW_IS_POSITIVE = True
 
-# The cash perimeter = Bank-type accounts PLUS explicit account IDs for Undeposited Funds.
-# UF is selected by explicit internal ID (122), NOT by account type: in this instance UF is a
-# type 'OthCurrAsset' (Other Current Asset) account, so 'UnDepFunds' matched nothing and made
-# UF invisible in balances AND movements (deposits then looked like a phantom inflow). We can't
-# filter on 'OthCurrAsset' either -- that would sweep in prepaids and every other OCA account --
-# so the account id is the only clean selector. Override via the CASH_EXTRA_ACCOUNT_IDS env var
-# (comma-separated) if the id ever changes or more non-bank cash accounts are added.
-CASH_ACCT_TYPES = ("Bank",)
-CASH_EXTRA_ACCOUNT_IDS = tuple(
-    int(x) for x in (os.environ.get("CASH_EXTRA_ACCOUNT_IDS") or "122").replace(" ", "").split(",") if x
+# The cash perimeter is an explicit ALLOWLIST of account internal IDs -- not an account-type
+# filter. We track only the operating account and Undeposited Funds:
+#     223 = First Bank (operating)        122 = Undeposited Funds
+# Selecting by accttype='Bank' also swept in Brokerage (312), First Bank of the Lake (311) and
+# Petty Cash (224) -- balances that aren't part of the operating-cash view and that added noise to
+# the daily net change. An explicit id list is the only clean selector (UF isn't even type 'Bank';
+# it is 'OthCurrAsset'). Override via CASH_ACCOUNT_IDS (comma-separated internal ids) when an
+# account is opened/closed. NOTE: changing this set re-bases total cash, so the next run should
+# re-bootstrap the prior baseline (delete state/cash_state.json) to avoid a one-time roll-forward
+# mismatch equal to the dropped accounts' balances.
+CASH_ACCOUNT_IDS = tuple(
+    int(x) for x in (os.environ.get("CASH_ACCOUNT_IDS") or "223,122").replace(" ", "").split(",") if x
 )
 
 PAYROLL_ACCOUNT_IDS: set[int] = set()
@@ -121,11 +124,39 @@ def _types_in(types: tuple[str, ...]) -> str:
 
 def _acct_selector(acct_types: tuple[str, ...], extra_ids: tuple[int, ...] = ()) -> str:
     """SQL predicate: account is one of these types OR one of these explicit internal IDs.
-    Lets us select banks by type and Undeposited Funds by id (its type doesn't match)."""
-    sel = f"a.accttype IN ({_types_in(acct_types)})"
+    With acct_types empty it becomes a pure id allowlist (the cash perimeter); with extra_ids
+    empty it is a pure type filter (the AR/AP GL totals)."""
+    parts = []
+    if acct_types:
+        parts.append(f"a.accttype IN ({_types_in(acct_types)})")
     if extra_ids:
-        sel = f"({sel} OR a.id IN ({', '.join(str(int(i)) for i in extra_ids)}))"
-    return sel
+        parts.append(f"a.id IN ({', '.join(str(int(i)) for i in extra_ids)})")
+    if not parts:
+        return "1=1"
+    return "(" + " OR ".join(parts) + ")"
+
+
+def _class_int(x):
+    """Coerce a project class id to int. SuiteQL hands back the custom-field value as a STRING
+    ('1'/'2') over REST, so a raw `== 1` int comparison silently fails and every job collapses to
+    Service. Returns None when the value is absent or unparseable."""
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_ns_date(s):
+    """Parse a NetSuite display date ('M/D/YYYY', or an ISO 'YYYY-MM-DD') to a date; None if it
+    can't be parsed. Used only for derived fields like days-overdue -- never for query bounds."""
+    if not s:
+        return None
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(str(s)[:10] if fmt == "%Y-%m-%d" else str(s), fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 # --------------------------------------------------------------------------------------
@@ -203,7 +234,7 @@ def cash_movements(prior: dt.date, report: dt.date, include_created: bool) -> li
         FROM   transactionaccountingline tal
         JOIN   transaction t ON t.id = tal.transaction
         JOIN   account a     ON a.id = tal.account
-        WHERE  {_acct_selector(CASH_ACCT_TYPES, CASH_EXTRA_ACCOUNT_IDS)}
+        WHERE  {_acct_selector((), CASH_ACCOUNT_IDS)}
           AND  tal.posting = 'T'
           AND  t.trandate <= TO_DATE('{report.isoformat()}', 'YYYY-MM-DD')
           AND  ( t.trandate > TO_DATE('{prior.isoformat()}', 'YYYY-MM-DD') {created_clause} )
@@ -244,22 +275,154 @@ def cash_in_by_project(prior: dt.date, report: dt.date, include_created: bool) -
           AND  pay.trandate <= TO_DATE('{report.isoformat()}', 'YYYY-MM-DD')
           AND  ( pay.trandate > TO_DATE('{prior.isoformat()}', 'YYYY-MM-DD') {created_clause} )
     """
-    return run_suiteql(sql)
+    rows = run_suiteql(sql)
+    for r in rows:
+        r["class_id"] = _class_int(r.get("class_id"))
+    return rows
 
 
 def overdue_bills(report: dt.date) -> dict:
-    """Open vendor bills past their due date, summed at remaining (unpaid) balance."""
+    """Open vendor bills whose due date is on or before the report date, at remaining (unpaid)
+    balance. The boundary is INCLUSIVE (<=): a bill due ON the report date is past due by the time
+    the snap is read the next morning, and a strict `<` dropped whole days of subcontractor bills
+    (e.g. all of a day's roofing subs) from the total -- the source of the ~$70k-vs-actual gap.
+    Returns the aggregate PLUS the full bill list so the summary and the overdue workbook share a
+    single query."""
     sql = f"""
-        SELECT COUNT(*) AS n, NVL(SUM(t.foreignamountunpaid), 0) AS overdue_total
+        SELECT t.tranid            AS bill_no,
+               BUILTIN.DF(t.entity) AS vendor,
+               t.trandate,
+               t.duedate,
+               ABS(t.foreigntotal)  AS bill_amount,
+               t.foreignamountunpaid AS unpaid,
+               t.status
         FROM   transaction t
         WHERE  t.type = 'VendBill'
-          AND  t.duedate < TO_DATE('{report.isoformat()}', 'YYYY-MM-DD')
+          AND  t.duedate <= TO_DATE('{report.isoformat()}', 'YYYY-MM-DD')
           AND  t.foreignamountunpaid > 0
+        ORDER BY t.duedate, vendor
+    """
+    bills = []
+    for r in run_suiteql(sql):
+        due = _parse_ns_date(r.get("duedate"))
+        bills.append({
+            "bill_no": r.get("bill_no"), "vendor": r.get("vendor"),
+            "trandate": r.get("trandate"), "duedate": r.get("duedate"),
+            "days_overdue": (report - due).days if due else None,
+            "bill_amount": round(float(r.get("bill_amount") or 0), 2),
+            "unpaid": round(float(r.get("unpaid") or 0), 2),
+            "status": r.get("status"),
+        })
+    total = round(sum(b["unpaid"] for b in bills), 2)
+    return {"basis": "due on or before report date", "asof": report.isoformat(),
+            "count": len(bills), "total": total, "bills": bills}
+
+
+def _window_clause(alias: str, prior: dt.date, report: dt.date, include_created: bool) -> str:
+    """trandate in (prior, report]  OR  created after prior (to catch back-posts) -- mirrors
+    cash_movements so an attribution query sees exactly the same transactions."""
+    created = (f"OR TRUNC({alias}.createddate) > TO_DATE('{prior.isoformat()}', 'YYYY-MM-DD')"
+               if include_created else "")
+    return (f"{alias}.trandate <= TO_DATE('{report.isoformat()}', 'YYYY-MM-DD') "
+            f"AND ({alias}.trandate > TO_DATE('{prior.isoformat()}', 'YYYY-MM-DD') {created})")
+
+
+def ap_paid_by_project(prior: dt.date, report: dt.date, include_created: bool) -> list[dict]:
+    """AP cash paid out in the window, attributed to projects via the GL reporting project.
+
+    Two disjoint paths, unioned:
+      (A) Bill payments (VendPymt) -> applied bill via PreviousTransactionLineLink (foreignamount =
+          amount paid on that bill) -> the bill's line-level reporting project.
+      (B) Direct checks (Check) -> the check's own non-mainline (expense) lines, which carry the
+          reporting project directly; amount = the line's debit.
+    Same window as cash_movements, so the attributed total ties to the AP-disbursements bucket.
+    One row per (payment, bill) for A and per (check, expense line) for B; amounts are positive."""
+    sql = f"""
+        SELECT payment_no, payment_date, vendor, source, reference, amt,
+               project_num, project_name, class_id
+        FROM (
+            SELECT pay.tranid       AS payment_no,
+                   pay.trandate     AS payment_date,
+                   BUILTIN.DF(pay.entity) AS vendor,
+                   'billpay'        AS source,
+                   bill.tranid      AS reference,
+                   link.foreignamount AS amt,
+                   proj.entityid    AS project_num,
+                   proj.companyname AS project_name,
+                   proj.{PROJECT_CLASS_FIELD} AS class_id
+            FROM   transaction pay
+            JOIN   PreviousTransactionLineLink link
+                     ON link.nextdoc = pay.id AND link.previoustype = 'VendBill'
+            JOIN   transaction bill ON bill.id = link.previousdoc
+            LEFT JOIN job proj ON proj.id = (
+                     SELECT MIN(tl.{PROJECT_GL_FIELD}) FROM transactionline tl
+                     WHERE  tl.transaction = bill.id AND tl.{PROJECT_GL_FIELD} IS NOT NULL)
+            WHERE  pay.type = 'VendPymt' AND {_window_clause('pay', prior, report, include_created)}
+            UNION ALL
+            SELECT t.tranid          AS payment_no,
+                   t.trandate        AS payment_date,
+                   BUILTIN.DF(t.entity) AS vendor,
+                   'check'           AS source,
+                   BUILTIN.DF(tl.account) AS reference,
+                   tl.amount         AS amt,
+                   proj.entityid     AS project_num,
+                   proj.companyname  AS project_name,
+                   proj.{PROJECT_CLASS_FIELD} AS class_id
+            FROM   transactionline tl
+            JOIN   transaction t ON t.id = tl.transaction
+            LEFT JOIN job proj ON proj.id = tl.{PROJECT_GL_FIELD}
+            WHERE  t.type = 'Check' AND tl.mainline = 'F'
+              AND  {_window_clause('t', prior, report, include_created)}
+        )
     """
     rows = run_suiteql(sql)
-    r = rows[0] if rows else {}
-    return {"basis": "overdue", "count": int(r.get("n") or 0),
-            "total": round(float(r.get("overdue_total") or 0), 2)}
+    for r in rows:
+        r["class_id"] = _class_int(r.get("class_id"))
+    return rows
+
+
+# Liability account types whose appearance in a journal's offsets signals debt principal.
+_LIABILITY_TYPES = ("LongTermLiab", "OthCurrLiab", "OthLiab", "CredCard")
+
+
+def journal_offsets(movements: list[dict]) -> dict:
+    """For every Journal that hit the cash perimeter in this window, return its offsetting GL
+    accounts (netted per account, dropping the cash-perimeter legs and any net-zero clearing
+    legs) so the narrative model can state each journal's PURPOSE instead of leaving it in
+    'Other / unclassified'. Grouping by account collapses paired intercompany-clearing legs to
+    zero automatically. When the surviving offsets are a single liability account plus an interest
+    line, we also hand over a deterministic suggested label (debt principal & interest)."""
+    jids = sorted({r.get("tran_id") for r in movements
+                   if (r.get("type_code") or "") == "Journal" and r.get("tran_id")})
+    if not jids:
+        return {}
+    id_list = ", ".join(str(int(i)) for i in jids)
+    cash_ids = ", ".join(str(int(i)) for i in CASH_ACCOUNT_IDS)
+    sql = f"""
+        SELECT t.tranid AS journal_no, acc.fullname AS account, acc.accttype,
+               SUM(tal.amount) AS net_amt
+        FROM   transaction t
+        JOIN   transactionaccountingline tal ON tal.transaction = t.id
+        JOIN   account acc ON acc.id = tal.account
+        WHERE  t.id IN ({id_list}) AND tal.posting = 'T'
+          AND  tal.account NOT IN ({cash_ids})
+        GROUP BY t.tranid, acc.fullname, acc.accttype
+        HAVING ABS(SUM(tal.amount)) > {EPSILON}
+        ORDER BY t.tranid, net_amt
+    """
+    out: dict[str, dict] = {}
+    for r in run_suiteql(sql):
+        out.setdefault(r.get("journal_no"), {"offsets": []})["offsets"].append({
+            "account": r.get("account"), "accttype": r.get("accttype"),
+            "amount": round(float(r.get("net_amt") or 0), 2),
+        })
+    for d in out.values():
+        offs = d["offsets"]
+        liab = [o for o in offs if o["accttype"] in _LIABILITY_TYPES]
+        interest = [o for o in offs if "interest" in (o["account"] or "").lower()]
+        if len(liab) == 1 and interest:
+            d["suggested_purpose"] = f"Debt Payment - {liab[0]['account']} (P&I)"
+    return out
 def load_state() -> dict | None:
     try:
         with open(STATE_PATH, encoding="utf-8") as f:
@@ -342,10 +505,33 @@ def cash_in_project_split(proj_rows: list[dict], cash_in_total: float) -> dict:
             "attributed_total": round(attributed, 2)}
 
 
+def ap_paid_project_split(ap_rows: list[dict], ap_total: float) -> dict:
+    """Split AP cash out: Production itemized by project; everything else (Service-class, no
+    project, overhead/SG&A) as 'Other', computed as the residual against the AP-disbursements
+    total so Production + Other always ties."""
+    prod: dict[tuple, float] = defaultdict(float)
+    attributed = 0.0
+    for r in ap_rows:
+        amt = round(float(r.get("amt") or 0), 2)
+        attributed += amt
+        num = r.get("project_num")
+        if r.get("class_id") == CLASS_PRODUCTION and num:
+            prod[(num, r.get("project_name") or num)] += amt
+    production = [{"project_num": k[0], "project_name": k[1], "amount": round(v, 2)}
+                  for k, v in prod.items()]
+    production.sort(key=lambda x: abs(x["amount"]), reverse=True)
+    prod_sum = round(sum(p["amount"] for p in production), 2)
+    return {"production": production,
+            "other": round(ap_total - prod_sum, 2),
+            "attributed_total": round(attributed, 2)}
+
+
 def build_summary(report: dt.date, prior_date: dt.date, prior_total: float,
                   prior_source: str, bal_today: list[dict], movements: list[dict],
                   ar_total: float, ap_total: float,
-                  proj_rows: list[dict] | None = None, unpaid: dict | None = None) -> dict:
+                  proj_rows: list[dict] | None = None, unpaid: dict | None = None,
+                  ap_rows: list[dict] | None = None,
+                  journal_details: dict | None = None) -> dict:
     by_acct = {r["account_id"]: float(r["balance"]) for r in bal_today}
     names = {r["account_id"]: r["fullname"] for r in bal_today}
     total_today = sum(by_acct.values())
@@ -376,6 +562,8 @@ def build_summary(report: dt.date, prior_date: dt.date, prior_total: float,
     cash_out_all = _itemize(movements, inflow=False)
     cash_in_total = round(sum(i["amount"] for i in cash_in_items), 2)
     proj_split = cash_in_project_split(proj_rows or [], cash_in_total)
+    ap_out_total = round(abs(buckets.get("AP disbursements", 0.0)), 2)
+    ap_split = ap_paid_project_split(ap_rows or [], ap_out_total)
     cash_out_total = round(sum(i["amount"] for i in cash_out_all), 2)
     cash_out_items = cash_out_all[:TOP_CEO_ITEMS]
     others = cash_out_all[TOP_CEO_ITEMS:]
@@ -408,6 +596,10 @@ def build_summary(report: dt.date, prior_date: dt.date, prior_total: float,
         flags.append(f"Cash-in-by-project attribution {proj_split['attributed_total']:,.2f} differs "
                      f"from AR inflow {cash_in_total:,.2f}; residual folded into Service -- check for "
                      f"payments not applied to invoices, or non-customer inflows.")
+    if ap_rows is not None and abs(ap_split["attributed_total"] - ap_out_total) > max(EPSILON, 0.005 * abs(ap_out_total)):
+        flags.append(f"AP-by-project attribution {ap_split['attributed_total']:,.2f} differs from AP "
+                     f"disbursements {ap_out_total:,.2f}; residual folded into Other -- check for "
+                     f"disbursement types beyond VendPymt/Check or unusual postings.")
 
     return {
         "report_date": report.isoformat(),
@@ -419,7 +611,10 @@ def build_summary(report: dt.date, prior_date: dt.date, prior_total: float,
         "net_change": round(net_change, 2),
         "ar_total": round(ar_total, 2),
         "ap_total": round(ap_total, 2),
-        "unpaid_bills": unpaid,   # {"basis":"overdue","count":N,"total":X} or None
+        # Aggregate only in the JSON payload; the full bill list rides in the overdue workbook.
+        "unpaid_bills": ({k: unpaid[k] for k in ("basis", "asof", "count", "total") if k in unpaid}
+                         if unpaid else None),
+        "journal_details": journal_details or {},   # {journal_no: {offsets:[...], suggested_purpose?}}
         "account_balances": [{"account": names.get(aid, aid), "balance": round(by_acct[aid], 2),
                               "type": next((r["accttype"] for r in bal_today
                                             if r["account_id"] == aid), "")}
@@ -429,6 +624,9 @@ def build_summary(report: dt.date, prior_date: dt.date, prior_total: float,
         "cash_in": {"total": cash_in_total,
                     "production": proj_split["production"],
                     "service": proj_split["service"]},
+        "ap_out": {"total": ap_out_total,
+                   "production": ap_split["production"],
+                   "other": ap_split["other"]},
         "cash_out": {"total": cash_out_total, "items": cash_out_items,
                      "all_others": cash_out_other},
         "reconciles": recon_ok,
@@ -474,9 +672,16 @@ def write_sections(summary: dict) -> tuple[str, str]:
         "sections separated by the delimiters shown, nothing before or after:\n"
         "<<<CFO>>>\n"
         "A precise CFO brief. One-line headline, then the drivers (by_bucket and top_movers), "
-        "then note collections (cash_in: the Production projects and the Service total) and "
-        "overdue unpaid bills (unpaid_bills), then every item in 'flags'. Keep full dollar figures "
-        "with cents. If 'reconciles' is false, lead with that and call the numbers provisional.\n"
+        "then note collections (cash_in: the Production projects and the Service total), AP paid by "
+        "project (ap_out: the Production projects and the Other total), and overdue unpaid bills "
+        "(unpaid_bills), then every item in 'flags'. Keep full dollar figures with cents. If "
+        "'reconciles' is false, lead with that and call the numbers provisional.\n"
+        "For any Journal in top_movers, look it up in 'journal_details' by its tranid and STATE ITS "
+        "PURPOSE from the offset accounts rather than calling it unclassified: if "
+        "'suggested_purpose' is present use it verbatim; otherwise infer from the offsets (e.g. a "
+        "single liability account plus an Interest Expense line is a debt principal-and-interest "
+        "payment -- name it 'Debt Payment - <liability account>'). Name the offset accounts and "
+        "amounts. Do not invent a purpose when the offsets don't support one.\n"
         "<<<CEO>>>\n"
         "A short text-message-style summary matching the example's format and rounding "
         "(round to $k/$m, abbreviate vendor/customer names sensibly). Rules:\n"
@@ -517,11 +722,11 @@ def movements_csv(movements: list[dict]) -> str:
     return buf.getvalue()
 
 
-def payments_workbook(proj_rows: list[dict]) -> bytes:
-    """Excel of the day's customer payments: a Detail sheet (one row per payment->invoice, with
-    customer and job), plus By-job and By-customer summaries. Amounts are the applied amount from
-    the payment->invoice link. Values are computed here (deterministic); the file carries no
-    formulas since the CI runner has no spreadsheet engine to recalculate them."""
+def payments_workbook(proj_rows: list[dict], ap_rows: list[dict] | None = None) -> bytes:
+    """Excel of the day's cash by project. AR (customer payments): AR detail (payment x invoice
+    with customer + job), AR by job, AR by customer. AP (vendor cash out): AP detail (payment/check
+    with vendor + job) and AP by job. Values are computed here (deterministic); no formulas, since
+    the CI runner has no spreadsheet engine to recalculate them."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
 
@@ -532,11 +737,10 @@ def payments_workbook(proj_rows: list[dict]) -> bytes:
     BOLD = Font(name="Arial", bold=True)
     CENTER = Alignment(horizontal="center")
     label = {CLASS_PRODUCTION: "Production", CLASS_SERVICE: "Service"}
+    ap_rows = ap_rows or []
 
-    def amt(r):
-        return round(float(r.get("applied_amt") or 0), 2)
-
-    def style_sheet(ws, ncols, widths, money_cols, total_row):
+    def style_sheet(ws, ncols, widths, money_cols):
+        total_row = ws.max_row
         for c in range(1, ncols + 1):
             cell = ws.cell(1, c)
             cell.font, cell.fill, cell.alignment = HDR_FONT, HDR_FILL, CENTER
@@ -551,49 +755,127 @@ def payments_workbook(proj_rows: list[dict]) -> bytes:
 
     wb = Workbook()
 
-    # Sheet 1 -- Detail (payment x invoice, with customer + job)
+    # ---- AR: customer payments received ----
+    def ar_amt(r): return round(float(r.get("applied_amt") or 0), 2)
+    ar = sorted(proj_rows, key=lambda r: (str(r.get("customer") or ""),
+                                          str(r.get("payment_no") or ""),
+                                          str(r.get("invoice_no") or "")))
+    ar_total = round(sum(ar_amt(r) for r in ar), 2)
+
     ws = wb.active
-    ws.title = "Detail"
+    ws.title = "AR detail"
     ws.append(["Payment #", "Date", "Customer", "Invoice #", "Job #", "Job name", "Class", "Amount"])
-    rows = sorted(proj_rows, key=lambda r: (str(r.get("customer") or ""),
-                                            str(r.get("payment_no") or ""),
-                                            str(r.get("invoice_no") or "")))
-    total = 0.0
-    for r in rows:
-        a = amt(r); total += a
+    for r in ar:
         ws.append([r.get("payment_no"), str(r.get("payment_date") or "")[:10], r.get("customer"),
                    r.get("invoice_no"), r.get("project_num") or "", r.get("project_name") or "",
-                   label.get(r.get("class_id"), ""), a])
-    ws.append(["", "", "", "", "", "", "Total", round(total, 2)])
-    style_sheet(ws, 8, [15, 12, 34, 16, 12, 30, 12, 16], (8,), ws.max_row)
+                   label.get(r.get("class_id"), ""), ar_amt(r)])
+    ws.append(["", "", "", "", "", "", "Total", ar_total])
+    style_sheet(ws, 8, [15, 12, 34, 16, 12, 30, 12, 16], (8,))
 
-    # Sheet 2 -- By job (Production itemized; everything else lumped as Service)
     prod: dict[tuple, float] = defaultdict(float)
     service = 0.0
-    for r in rows:
+    for r in ar:
         if r.get("class_id") == CLASS_PRODUCTION and r.get("project_num"):
-            prod[(r["project_num"], r.get("project_name") or r["project_num"])] += amt(r)
+            prod[(r["project_num"], r.get("project_name") or r["project_num"])] += ar_amt(r)
         else:
-            service += amt(r)
-    ws2 = wb.create_sheet("By job")
+            service += ar_amt(r)
+    ws2 = wb.create_sheet("AR by job")
     ws2.append(["Job #", "Job name", "Amount"])
     for (num, name), v in sorted(prod.items(), key=lambda kv: kv[1], reverse=True):
         ws2.append([num, name, round(v, 2)])
     if round(service, 2):
         ws2.append(["", "Service (all non-Production)", round(service, 2)])
-    ws2.append(["", "Total", round(total, 2)])
-    style_sheet(ws2, 3, [14, 40, 16], (3,), ws2.max_row)
+    ws2.append(["", "Total", ar_total])
+    style_sheet(ws2, 3, [14, 40, 16], (3,))
 
-    # Sheet 3 -- By customer
     bycust: dict[str, float] = defaultdict(float)
-    for r in rows:
-        bycust[r.get("customer") or "(unknown)"] += amt(r)
-    ws3 = wb.create_sheet("By customer")
+    for r in ar:
+        bycust[r.get("customer") or "(unknown)"] += ar_amt(r)
+    ws3 = wb.create_sheet("AR by customer")
     ws3.append(["Customer", "Amount"])
     for name, v in sorted(bycust.items(), key=lambda kv: kv[1], reverse=True):
         ws3.append([name, round(v, 2)])
-    ws3.append(["Total", round(total, 2)])
-    style_sheet(ws3, 2, [40, 16], (2,), ws3.max_row)
+    ws3.append(["Total", ar_total])
+    style_sheet(ws3, 2, [40, 16], (2,))
+
+    # ---- AP: vendor cash paid out ----
+    def ap_amt(r): return round(float(r.get("amt") or 0), 2)
+    ap = sorted(ap_rows, key=lambda r: (str(r.get("vendor") or ""), str(r.get("payment_no") or "")))
+    ap_total = round(sum(ap_amt(r) for r in ap), 2)
+
+    ws4 = wb.create_sheet("AP detail")
+    ws4.append(["Payment #", "Date", "Vendor", "Type", "Bill / account",
+                "Job #", "Job name", "Class", "Amount"])
+    for r in ap:
+        ws4.append([r.get("payment_no"), str(r.get("payment_date") or "")[:10], r.get("vendor"),
+                    r.get("source"), r.get("reference"), r.get("project_num") or "",
+                    r.get("project_name") or "", label.get(r.get("class_id"), ""), ap_amt(r)])
+    ws4.append(["", "", "", "", "", "", "", "Total", ap_total])
+    style_sheet(ws4, 9, [15, 12, 30, 9, 22, 12, 28, 12, 16], (9,))
+
+    approd: dict[tuple, float] = defaultdict(float)
+    other = 0.0
+    for r in ap:
+        if r.get("class_id") == CLASS_PRODUCTION and r.get("project_num"):
+            approd[(r["project_num"], r.get("project_name") or r["project_num"])] += ap_amt(r)
+        else:
+            other += ap_amt(r)
+    ws5 = wb.create_sheet("AP by job")
+    ws5.append(["Job #", "Job name", "Amount"])
+    for (num, name), v in sorted(approd.items(), key=lambda kv: kv[1], reverse=True):
+        ws5.append([num, name, round(v, 2)])
+    if round(other, 2):
+        ws5.append(["", "Other / non-project", round(other, 2)])
+    ws5.append(["", "Total", ap_total])
+    style_sheet(ws5, 3, [14, 40, 16], (3,))
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def overdue_bills_workbook(unpaid: dict) -> bytes:
+    """One-sheet Excel of every open vendor bill due on or before the report date, so the AP total
+    can be reconciled line by line. Most-overdue first; values only (CI has no recalc engine)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    MONEY = "#,##0.00"
+    HDR_FONT = Font(name="Arial", bold=True, color="FFFFFF")
+    HDR_FILL = PatternFill("solid", fgColor="1F4E78")
+    BASE = Font(name="Arial")
+    BOLD = Font(name="Arial", bold=True)
+    CENTER = Alignment(horizontal="center")
+
+    bills = sorted(unpaid.get("bills", []),
+                   key=lambda b: (b.get("days_overdue") is None, -(b.get("days_overdue") or 0)))
+    total = round(sum(float(b.get("unpaid") or 0) for b in bills), 2)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Overdue bills"
+    ws.append(["Bill #", "Vendor", "Bill date", "Due date", "Days overdue",
+               "Bill amount", "Unpaid balance", "Status"])
+    for b in bills:
+        ws.append([b.get("bill_no") or "", b.get("vendor") or "",
+                   str(b.get("trandate") or "")[:10], str(b.get("duedate") or "")[:10],
+                   b.get("days_overdue"), round(float(b.get("bill_amount") or 0), 2),
+                   round(float(b.get("unpaid") or 0), 2), b.get("status") or ""])
+    ws.append(["", "", "", "", "", "", total, ""])
+    total_row = ws.max_row
+    for c in range(1, 9):
+        cell = ws.cell(1, c)
+        cell.font, cell.fill, cell.alignment = HDR_FONT, HDR_FILL, CENTER
+    for r in range(2, total_row + 1):
+        for c in range(1, 9):
+            ws.cell(r, c).font = BOLD if r == total_row else BASE
+        ws.cell(r, 6).number_format = MONEY
+        ws.cell(r, 7).number_format = MONEY
+    ws.cell(total_row, 5).value = "Total"
+    ws.cell(total_row, 5).font = BOLD
+    for i, wdt in enumerate([16, 34, 12, 12, 13, 15, 16, 9], 1):
+        ws.column_dimensions[chr(64 + i)].width = wdt
+    ws.freeze_panes = "A2"
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -622,18 +904,39 @@ def cfo_detail_block(summary: dict) -> str:
             lines.append(f"        {p['project_num']:<10} {(p['project_name'] or ''):<28} "
                          f"{p['amount']:>14,.2f}")
     lines.append(f"    {'Service:':<39}{ci['service']:>14,.2f}")
+    ap = summary.get("ap_out")
+    if ap:
+        lines.append("")
+        lines.append(f"AP paid by project: {ap['total']:,.2f}")
+        if ap.get("production"):
+            lines.append("    Production:")
+            for p in ap["production"]:
+                lines.append(f"        {p['project_num']:<10} {(p['project_name'] or ''):<28} "
+                             f"{p['amount']:>14,.2f}")
+        lines.append(f"    {'Other / non-project:':<39}{ap['other']:>14,.2f}")
     ub = summary.get("unpaid_bills")
     if ub:
         lines.append("")
-        lines.append(f"Overdue unpaid bills (due before {summary['report_date']}): "
-                     f"{ub['total']:,.2f}  ({ub['count']} bills)")
+        lines.append(f"Overdue unpaid bills (due on or before {summary['report_date']}): "
+                     f"{ub['total']:,.2f}  ({ub['count']} bills) -- see the overdue-bills Excel")
+    jd = summary.get("journal_details") or {}
+    if jd:
+        lines.append("")
+        lines.append("Journal purposes (offsets, net of clearing):")
+        for jn, d in jd.items():
+            label = d.get("suggested_purpose")
+            lines.append(f"    {jn}" + (f"  -- {label}" if label else ""))
+            for o in d.get("offsets", []):
+                lines.append(f"        {(o['account'] or ''):<34} {o['amount']:>14,.2f}  "
+                             f"[{o['accttype']}]")
     lines.append("")
     lines.append(f"Reconciles (roll-forward): {summary['reconciles']}")
     return "\n".join(lines)
 
 
 def send_email(summary: dict, cfo_narrative: str, ceo_block: str, movements: list[dict],
-               proj_rows: list[dict] | None = None) -> None:
+               proj_rows: list[dict] | None = None, ap_rows: list[dict] | None = None,
+               unpaid: dict | None = None) -> None:
     msg = EmailMessage()
     msg["Subject"] = f"Cash snap -- {summary['report_date']}"
     msg["From"], msg["To"] = MAIL_FROM, MAIL_TO
@@ -644,8 +947,9 @@ def send_email(summary: dict, cfo_narrative: str, ceo_block: str, movements: lis
         f"{cfo_detail_block(summary)}\n\n\n"
         "===== CEO OUTPUT =====\n\n"
         f"{ceo_block}\n\n"
-        "(full numbers in the attached JSON; cash line detail in the CSV; "
-        "payments received by invoice/job/customer in the Excel)\n"
+        "(full numbers in the attached JSON; cash line detail in the CSV; cash in/out by "
+        "invoice/job/customer/vendor in the payments Excel; every overdue bill line by line in "
+        "the overdue-bills Excel)\n"
     )
     msg.set_content(body)
     msg.add_attachment(json.dumps(summary, indent=2, default=str).encode(),
@@ -653,11 +957,16 @@ def send_email(summary: dict, cfo_narrative: str, ceo_block: str, movements: lis
                        filename=f"cash_snap_{summary['report_date']}.json")
     msg.add_attachment(movements_csv(movements).encode(), maintype="text", subtype="csv",
                        filename=f"cash_movements_{summary['report_date']}.csv")
-    if proj_rows is not None:
+    if proj_rows is not None or ap_rows is not None:
         msg.add_attachment(
-            payments_workbook(proj_rows), maintype="application",
+            payments_workbook(proj_rows or [], ap_rows or []), maintype="application",
             subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=f"payments_received_{summary['report_date']}.xlsx")
+            filename=f"payments_by_project_{summary['report_date']}.xlsx")
+    if unpaid and unpaid.get("bills"):
+        msg.add_attachment(
+            overdue_bills_workbook(unpaid), maintype="application",
+            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=f"overdue_bills_{summary['report_date']}.xlsx")
     _smtp_send(msg)
 
 
@@ -690,10 +999,10 @@ def _smtp_send(msg: EmailMessage) -> None:
 def main() -> int:
     try:
         report = resolve_report_date()
-        bal_today = balances_as_of(report, CASH_ACCT_TYPES, extra_account_ids=CASH_EXTRA_ACCOUNT_IDS)
+        bal_today = balances_as_of(report, (), extra_account_ids=CASH_ACCOUNT_IDS)
         if not bal_today:
-            raise RuntimeError("No cash-account balances returned -- check role permissions, "
-                               "the Bank account type, and CASH_EXTRA_ACCOUNT_IDS (Undeposited Funds).")
+            raise RuntimeError("No cash-account balances returned -- check role permissions and "
+                               "the CASH_ACCOUNT_IDS allowlist (default 223 First Bank, 122 UF).")
         total_today = sum(float(r["balance"]) for r in bal_today)
 
         state = load_state()
@@ -708,9 +1017,9 @@ def main() -> int:
             # EXCLUDING anything back-posted afterward (created after prior_date). Those
             # back-posts then surface in this run's movements via include_created=True, so the
             # first run is a true roll-forward instead of a naive recompute that would bury them.
-            prior_total = total_balance(prior_date, CASH_ACCT_TYPES,
+            prior_total = total_balance(prior_date, (),
                                         created_on_or_before=prior_date,
-                                        extra_account_ids=CASH_EXTRA_ACCOUNT_IDS)
+                                        extra_account_ids=CASH_ACCOUNT_IDS)
             prior_source = "bootstrap"
             include_created = True
 
@@ -719,12 +1028,16 @@ def main() -> int:
         ap_total = abs(total_balance(report, ("AcctPay",)))
         proj_rows = cash_in_by_project(prior_date, report, include_created)
         unpaid = overdue_bills(report)
+        ap_rows = ap_paid_by_project(prior_date, report, include_created)
+        journal_details = journal_offsets(movements)
 
         summary = build_summary(report, prior_date, prior_total, prior_source,
                                 bal_today, movements, ar_total, ap_total,
-                                proj_rows=proj_rows, unpaid=unpaid)
+                                proj_rows=proj_rows, unpaid=unpaid, ap_rows=ap_rows,
+                                journal_details=journal_details)
         cfo_narrative, ceo_block = write_sections(summary)
-        send_email(summary, cfo_narrative, ceo_block, movements, proj_rows=proj_rows)
+        send_email(summary, cfo_narrative, ceo_block, movements,
+                   proj_rows=proj_rows, ap_rows=ap_rows, unpaid=unpaid)
 
         # Log only after a successful send; the workflow commits this file.
         save_state(report, total_today, bal_today)
