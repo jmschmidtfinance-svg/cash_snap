@@ -40,28 +40,32 @@ Notes / gotchas about access:
 
 ## 2. Cash / cash-equivalent accounts
 
-**The cash perimeter is Bank accounts + Undeposited Funds.** We treat "cash" as the combined
-balance of both, because a customer check we've received but not yet deposited is economically
-cash-in-hand. In SuiteQL we select banks by type and UF by explicit id:
-`(account.accttype = 'Bank' OR account.id = 122)` — see the note below for why.
+**The cash perimeter is an explicit allowlist of account internal IDs — First Bank (223) and
+Undeposited Funds (122) only.** We treat "cash" as the combined balance of these two, because a
+customer check we've received but not yet deposited is economically cash-in-hand. In SuiteQL we
+select by id: `account.id IN (223, 122)` (see the note below for why an allowlist, not a type filter).
 
-| Internal ID | Acct # | Account name | accttype | Purpose / notes |
-|---|---|---|---|---|
-| `[FILL IN]` | `[FILL IN]` | First Bank | Bank | **Main operating account — nearly all daily bank activity flows here.** |
-| `122` | `[FILL IN]` | Undeposited Funds | OthCurrAsset | **Checks received but not yet formally deposited. Selected by explicit id (see below). In the cash perimeter as of v2.** |
-| `[FILL IN]` | `[FILL IN]` | Brokerage Account | Bank | Effectively static (~$8.4k on 2026-06-29). |
-| `[FILL IN]` | `[FILL IN]` | First Bank of the Lake | Bank | Effectively static (~$302). |
-| `[FILL IN]` | `[FILL IN]` | Petty Cash | Bank | Effectively static (~$212). |
+| Internal ID | Acct # | Account name | accttype | In perimeter? | Purpose / notes |
+|---|---|---|---|---|---|
+| `223` | `100` | First Bank | Bank | **Yes** | **Main operating account — nearly all daily bank activity flows here.** |
+| `122` | — | Undeposited Funds | OthCurrAsset | **Yes** | Checks received but not yet formally deposited. Selected by explicit id. |
+| `312` | — | Brokerage Account | Bank | No | Static (~$8.4k on 2026-06-29); excluded as of v3. |
+| `311` | — | First Bank of the Lake | Bank | No | Static (~$302); excluded as of v3. |
+| `224` | `104` | Petty Cash | Bank | No | Static (~$212); excluded as of v3. |
 
 Decisions to record:
-- Only **First Bank** and **Undeposited Funds** move day to day; the other three carry static
-  balances. The snap still reports all of them so any change surfaces.
+- **v3 (2026-07-01): perimeter narrowed to an id allowlist `{223, 122}`.** Previously it was every
+  `Bank`-type account + UF, which pulled Brokerage (312), First Bank of the Lake (311) and Petty
+  Cash (224) into total cash — static balances that added noise to the daily net change and aren't
+  part of the operating-cash view. Only First Bank and UF are transactional, so the perimeter is now
+  those two by internal id. Override via `CASH_ACCOUNT_IDS` (comma-separated internal ids, default
+  `"223,122"`). NOTE: narrowing the perimeter re-bases total cash (drops ~$8,943.69 of static
+  balances), so `state/cash_state.json` must be deleted before the next run to re-bootstrap the
+  baseline (otherwise the roll-forward mismatches; this also clears the pre-existing −$715 gap).
 - **Undeposited Funds is account id 122, type `OthCurrAsset` (Other Current Asset) — NOT the
-  built-in `UnDepFunds` type** (confirmed 2026-07-01). This bit us on the first run: the
-  `accttype IN ('Bank','UnDepFunds')` filter matched no UF account, so UF was invisible in
-  balances AND movements and deposits showed up as a phantom ~$973k inflow. We select UF by
-  explicit id (`CASH_EXTRA_ACCOUNT_IDS`, default `122`). We deliberately do **not** filter on
-  `OthCurrAsset` — that would sweep in prepaids and every other Other Current Asset account.
+  built-in `UnDepFunds` type** (confirmed 2026-07-01). Selecting UF needs its explicit id; an
+  `accttype`-based filter can't reach it, and filtering on `OthCurrAsset` would sweep in prepaids and
+  every other Other Current Asset account. The id allowlist sidesteps both problems.
 
 
 ---
@@ -81,7 +85,7 @@ Decisions to record:
 
 | Field/segment | Script ID / column | Where it appears | Meaning | Used in cash snap? |
 |---|---|---|---|---|
-| Job class | `custentity_r_it_class` | project (`job`) record | **1 = Production, 2 = Service** (matches the Class master, §3). Distribution: 354 Production, 11,925 Service, 2 null. This is the authoritative Production/Service flag. | Yes — cash-in split |
+| Job class | `custentity_r_it_class` | project (`job`) record | **1 = Production, 2 = Service** (matches the Class master, §3). Distribution: 354 Production, 11,925 Service, 2 null. This is the authoritative Production/Service flag. **GOTCHA: the SuiteQL REST client returns this value as a STRING (`"1"`/`"2"`), not an int, so a raw `== 1` comparison silently fails and every job collapses to Service (blank Class column, no Production breakout). Coerce to int at the source of every by-project query (`_class_int()`), confirmed 2026-07-01.** | Yes — cash-in split |
 | GL project | `custcol_r_it_reporting_project` | invoice **line** | The RABB-IT reporting project (a `job` id) on the line. Populated on Production invoices; **null on Service** (fine — those fall through to Service). NOT the header customer. | Yes — cash-in split |
 | Procore project # | `custentity_r_it_pc_project_number` | project (`job`) record | RABB-IT's Procore project number (usually equals `entityid`). | Reference |
 
@@ -100,7 +104,7 @@ stand-in; that is superseded.)
 ## 5. Transaction types in use
 
 Use `BUILTIN.DF(t.type)` for the human label. **Confirmed against real data 2026-06-29**
-unless noted. Bucketing reflects the v2 cash perimeter (Bank + UF).
+unless noted. Bucketing reflects the v3 cash perimeter (id allowlist {223 First Bank, 122 UF}).
 
 | Type code | Label (BUILTIN.DF) | Touches cash? | Bucket | Verified |
 |---|---|---|---|---|
@@ -137,7 +141,7 @@ SELECT a.id AS account_id, a.acctnumber, a.fullname, a.accttype,
 FROM   transactionaccountingline tal
 JOIN   transaction t ON t.id = tal.transaction
 JOIN   account a     ON a.id = tal.account
-WHERE  (a.accttype = 'Bank' OR a.id = 122)          -- banks by type, Undeposited Funds by id
+WHERE  a.id IN (223, 122)                            -- explicit cash perimeter (CASH_ACCOUNT_IDS)
   AND  tal.posting = 'T'
   AND  t.trandate <= TO_DATE(:as_of_date, 'YYYY-MM-DD')
   -- AND TRUNC(t.createddate) <= TO_DATE(:created_cutoff, 'YYYY-MM-DD')  -- bootstrap only
@@ -156,7 +160,7 @@ SELECT t.id AS tran_id, t.tranid, t.trandate, t.createddate,
 FROM   transactionaccountingline tal
 JOIN   transaction t ON t.id = tal.transaction
 JOIN   account a     ON a.id = tal.account
-WHERE  (a.accttype = 'Bank' OR a.id = 122)          -- banks by type, Undeposited Funds by id
+WHERE  a.id IN (223, 122)                            -- explicit cash perimeter (CASH_ACCOUNT_IDS)
   AND  tal.posting = 'T'
   AND  t.trandate <= TO_DATE(:report_date, 'YYYY-MM-DD')
   AND  ( t.trandate > TO_DATE(:prior_date, 'YYYY-MM-DD')
@@ -207,17 +211,63 @@ Code then groups class 1 (Production) by project #/name; **Service = the residua
 AR inflow total, so Production + Service always ties. `PreviousTransactionLineLink` link fields:
 `nextdoc`=payment, `previousdoc`=invoice, `previoustype`='CustInvc', `foreignamount`=applied amount.
 
-### 6e. Overdue unpaid bills  ✅ verified 2026-07-01
-Open vendor bills past their due date, at remaining (unpaid) balance. Overdue = `duedate` strictly
-before the report date; open = `foreignamountunpaid > 0` (header field). 6/30: $70,140.53, 23 bills.
+### 6e. Overdue unpaid bills  ✅ verified 2026-07-01 (boundary fixed)
+Open vendor bills due **on or before** the report date, at remaining (unpaid) balance. Open =
+`foreignamountunpaid > 0` (header field). **Boundary is INCLUSIVE (`<=`).** It was originally strict
+`<`, which dropped every bill due *on* the report date — for 7/1 that hid ~$82.7k of subcontractor
+bills (roofing subs + Watco + AXA) and undercounted overdue by more than half ($71k vs $153,922.83 /
+33 bills). A bill due on the report date is past due by the time the snap is read the next morning,
+so it belongs. No null-amount or missing-duedate rows exist. `overdue_bills()` now returns the full
+bill list (with `days_overdue`), and the summary carries the aggregate `{basis, asof, count, total}`.
 
 ```sql
-SELECT COUNT(*) AS n, NVL(SUM(t.foreignamountunpaid), 0) AS overdue_total
+SELECT t.tranid AS bill_no, BUILTIN.DF(t.entity) AS vendor, t.trandate, t.duedate,
+       ABS(t.foreigntotal) AS bill_amount, t.foreignamountunpaid AS unpaid, t.status
 FROM   transaction t
 WHERE  t.type = 'VendBill'
-  AND  t.duedate < TO_DATE(:report_date, 'YYYY-MM-DD')
+  AND  t.duedate <= TO_DATE(:report_date, 'YYYY-MM-DD')   -- INCLUSIVE
   AND  t.foreignamountunpaid > 0
+ORDER BY t.duedate, vendor
 ```
+The full list ships as the `overdue_bills_<date>.xlsx` attachment (`overdue_bills_workbook()`,
+openpyxl, most-overdue first) so the AP total can be reconciled line by line.
+
+### 6f. AP paid by project (Production itemized / Other lumped)  ✅ verified 2026-07-01
+The AP-disbursements outflow attributed to projects. Two disjoint paths, unioned; both read the GL
+**reporting project** (`custcol_r_it_reporting_project`). Same roll-forward window as §6b. Verified
+6/30: bill payments $760 + direct checks $59,837.02 = $60,597.02 (ties to the AP bucket; all
+non-project that day). Recent Production example: bill payment → `1478ILM` "Galleria West" $11,834.10.
+
+- **(A) Bill payments** (`VendPymt`): payment → applied bill via `PreviousTransactionLineLink`
+  (`nextdoc`=payment, `previoustype`='VendBill', `foreignamount`=amount paid on the bill) → the
+  **bill's** reporting project. NOTE `foreignamount` is correct on current payments; some legacy
+  (2024) links show 0 — ignore, out of window.
+- **(B) Direct checks** (`Check`): the check's own non-mainline (expense) lines carry the reporting
+  project directly; amount = the line's debit (`tl.amount`, mainline='F'). (A `Check` that pays a
+  bill instead posts to AP with no project → falls to Other; rare here.)
+
+```sql
+-- (A) bill payments
+SELECT pay.tranid AS payment_no, link.foreignamount AS amt,
+       proj.entityid AS project_num, proj.custentity_r_it_class AS class_id
+FROM   transaction pay
+JOIN   PreviousTransactionLineLink link ON link.nextdoc = pay.id AND link.previoustype = 'VendBill'
+JOIN   transaction bill ON bill.id = link.previousdoc
+LEFT JOIN job proj ON proj.id = (SELECT MIN(tl.custcol_r_it_reporting_project) FROM transactionline tl
+                                 WHERE tl.transaction = bill.id AND tl.custcol_r_it_reporting_project IS NOT NULL)
+WHERE  pay.type = 'VendPymt' AND <roll-forward window on pay>
+UNION ALL
+-- (B) direct checks
+SELECT t.tranid AS payment_no, tl.amount AS amt,
+       proj.entityid AS project_num, proj.custentity_r_it_class AS class_id
+FROM   transactionline tl
+JOIN   transaction t ON t.id = tl.transaction
+LEFT JOIN job proj ON proj.id = tl.custcol_r_it_reporting_project
+WHERE  t.type = 'Check' AND tl.mainline = 'F' AND <roll-forward window on t>
+```
+Code groups class 1 (Production) by project; **Other = residual** vs the AP-disbursements total, so
+Production + Other ties. (Most AP is overhead/SG&A with no project → Other; job-cost subs land on
+Production once bills/checks carry the reporting project.)
 
 ### Sign convention  ✅ VERIFIED 2026-06-29
 Cash **increase** posts as positive `tal.amount` (debit-positive). Inflows positive, outflows
@@ -241,7 +291,7 @@ Each posting line hitting a cash account is assigned to exactly one bucket. Firs
 | 2 | `type_code = 'CustPymt'` | `AR collections` | ✅ inflow recognized here (to UF or Bank) |
 | 3 | `type_code = 'Paycheck'` OR account in payroll set | `Payroll` | not yet seen |
 | 4 | `type_code IN ('VendPymt','Check')` | `AP disbursements` | ✅ confirmed |
-| 5 | `type_code = 'Journal'` AND account = `[debt acct]` | `Debt service` | `[FILL IN debt acct]` |
+| 5 | `type_code = 'Journal'` whose offsets net to one liability acct + Interest Expense | `Debt service` (labeled) | Debt P&I payment — see the journal-purpose rule below. Liability accts seen: **SBA Loan**, **Loan - Other** (both `LongTermLiab`). |
 | 6 | `type_code = 'Journal'` AND account = `[tax acct]` | `Taxes` | `[FILL IN tax acct]` |
 | 99 | (fallback) | `Other / unclassified` | Flag for review if material |
 
@@ -250,12 +300,26 @@ Special rules / exclusions:
   customer payment is attributed to the project(s) it collected against: **Production** (project
   class 1) itemized by project #/name; everything else (Service class, or no GL project) summed as
   **Service**, computed as the residual so Production + Service ties to the AR inflow.
+- **AP disbursements sub-split by project (§6f).** Within the `AP disbursements` bucket, each
+  vendor payment/check is attributed via the GL reporting project (bill payments → bill's project;
+  direct checks → the check's own line project): **Production** itemized, everything else (overhead/
+  SG&A, Service, no project) summed as **Other**, the residual so Production + Other ties.
 - **UF ↔ Bank deposits net to zero** across the cash perimeter (both legs are cash accounts),
   so the reconciliation handles them automatically; bucketing them as `Internal transfer`
   keeps them out of the driver explanation.
+- **Journal purpose via offsets (resolved 2026-07-01).** Journals that hit cash used to fall to
+  `Other / unclassified`. `journal_offsets()` now pulls each cash-hitting journal's offsetting GL
+  accounts, **netted per account** — which cancels the paired intercompany-clearing legs to zero
+  automatically — leaving only the meaningful lines. When those are a single liability account plus
+  an Interest Expense line it's a debt principal-and-interest payment, and the code hands the model a
+  deterministic `suggested_purpose` (e.g. **"Debt Payment - SBA Loan (P&I)"**). The narrative model
+  labels each journal from this detail instead of leaving it unclassified. Verified 7/1: JE14866
+  −$59,607.52 = SBA Loan $36,402.08 + Interest $23,205.44; JE14906 −$32,804.25 = Loan - Other
+  $23,314.65 + Interest $9,489.60. (Bucketing still tags them `Other / unclassified`; the *label* is
+  what changed. Formalizing a deterministic `Debt service` bucket is a possible next step.)
 - **Bank-interest journals** (small `Journal` entries to First Bank, e.g. JE14865 +$69.36 on
-  2026-06-29) fall to `Other / unclassified`. DECISION PENDING: add a `Bank interest /
-  adjustments` rule, or classify journals by their non-bank offset leg. See §10.
+  2026-06-29) still fall to `Other / unclassified` — their only offset is an income account, so no
+  debt label applies.
 - Some `Check`s are lease/loan payments (Ford Credit, MBFS). `[CONSIDER]` routing to
   `Debt service` later.
 
@@ -270,7 +334,7 @@ Special rules / exclusions:
 | Report date | Yesterday (the just-closed day), UTC-yesterday at fire time |
 | Compares | Closing cash today vs the last **reported** balance (roll-forward — see §9) |
 | Delivery channel | Email from `jmschmidtfinance@gmail.com` → Jamie's inbox; Jamie forwards to CEO |
-| Attachments | `cash_snap_<date>.json` (full summary), `cash_movements_<date>.csv` (cash line detail), `payments_received_<date>.xlsx` (payments received — Detail by payment×invoice with customer + job, plus By-job and By-customer sheets; built with openpyxl, values only) |
+| Attachments | `cash_snap_<date>.json` (full summary), `cash_movements_<date>.csv` (cash line detail), `payments_by_project_<date>.xlsx` (cash in AND out by project — sheets: AR detail [payment×invoice + customer + job], AR by job, AR by customer, AP detail [payment/check + vendor + job], AP by job), `overdue_bills_<date>.xlsx` (every open bill due on/before the report date, most-overdue first — Bill#/Vendor/Bill date/Due date/Days overdue/Bill amount/Unpaid/Status); all openpyxl, values only |
 | "Call out" threshold | `SNAP_THRESHOLD` = 10000 (any single item/bucket beyond this is flagged) |
 | Format | **Plain text** (no Markdown) |
 
@@ -299,7 +363,7 @@ Cash out: $61k
 ```
 - **Cash** = Bank + Undeposited Funds. **AR** = AcctRec total. **AP** = AcctPay total (abs).
 - **Overdue bills** — open vendor bills past due date (§6e), shown as `$total (count)`. The summary
-  carries `unpaid_bills = {basis:"overdue", count, total}`; if null, render `[tbd]`.
+  carries `unpaid_bills = {basis:"due on or before report date", asof, count, total}`; if null, render `[tbd]`. Full per-bill list ships in `overdue_bills_<date>.xlsx`.
 - **Cash in** — split by project (§6d/§7): **Production** itemized as `Name (project#) - $Xk`;
   **Service** a single total. **Cash out** — by vendor, top ~8 then an "All others" rollup.
 
@@ -362,17 +426,20 @@ never categorizes, sums, or reconciles. (Validated end-to-end 2026-06-29.)
   **or** createddate. The bootstrap deliberately reconstructs a clean prior (excluding
   late-created entries) so day one isn't a naive recompute. All of this relies on
   `t.createddate` reflecting when an entry hit the books — the first run is our real-world test.
-- **Cash perimeter = Bank + Undeposited Funds (v2).** Only First Bank and UF are transactional;
-  Brokerage, First Bank of the Lake, and Petty Cash are effectively static. A Deposit is a
-  UF→Bank internal move and nets to zero.
+- **Cash perimeter = id allowlist {223 First Bank, 122 UF} (v3, 2026-07-01).** Only these two are
+  transactional; Brokerage (312), First Bank of the Lake (311), and Petty Cash (224) are static and
+  now **excluded** (previously the `Bank`-type filter pulled them in). A Deposit is a UF→Bank
+  internal move and nets to zero. Override via `CASH_ACCOUNT_IDS`. Narrowing re-bases total cash
+  (−~$8,943.69) → delete `state/cash_state.json` before the next run to re-bootstrap.
 - **Undeposited Funds is id 122, type `OthCurrAsset` — not `UnDepFunds` (confirmed 2026-07-01).**
   The first live run (report_date 6/30) proved this: the `('Bank','UnDepFunds')` type filter
   matched no UF account, so UF was absent from balances AND movements, the ~4 payments into UF
   on 6/29 were missed, and the day's deposits surfaced as a phantom +$973k "Internal transfer"
   (only the First Bank leg was visible). Fix: select UF by explicit id (default 122), keep banks
   by type. Do not filter on `OthCurrAsset` — it would pull in prepaids and other OCA accounts.
-- **Bank-interest journals:** small `Journal` entries to First Bank land in
-  `Other / unclassified` and are almost certainly bank interest — see §7 decision pending.
+- **Journals hitting cash** are now labeled by purpose via `journal_offsets()` (netted offset
+  accounts; one liability + Interest Expense ⇒ debt P&I, e.g. "Debt Payment - SBA Loan (P&I)").
+  Small bank-interest journals (only an income offset) remain `Other / unclassified`. See §7.
 - `[FILL IN — month-end timing effects, holiday calendars, when deposits clear, etc.]`
 
 ---
@@ -387,3 +454,5 @@ never categorizes, sums, or reconciles. (Validated end-to-end 2026-06-29.)
 | 2026-07-01 | First live run (6/30) exposed the UF bug: Undeposited Funds is id 122 / type `OthCurrAsset`, not `UnDepFunds`, so the type filter matched nothing and UF was invisible everywhere (phantom +$973k "Internal transfer"). Fix: select banks by type + UF by explicit id (default 122, `CASH_EXTRA_ACCOUNT_IDS` overrides); added an optional `report_date` workflow_dispatch input. Requires deleting the stale Bank-only `state/cash_state.json` so the next run re-bootstraps with UF included. | |
 | 2026-07-01 | **Cash-in by project + overdue bills.** Verified against live NetSuite: project = `job` record (# = entityid, name = companyname); GL project on invoice line = `custcol_r_it_reporting_project`; class = `custentity_r_it_class` (1 Production / 2 Service); payment→invoice link = `PreviousTransactionLineLink` (`foreignamount` = applied amount). Cash-in now splits Production (itemized by project) vs Service (residual); ties to AR inflow ($64,160.57 on 6/30). Overdue unpaid bills (§6e): `VendBill`, `duedate < report`, `foreignamountunpaid > 0` ($70,140.53 / 23 bills on 6/30). New code: `cash_in_by_project()`, `overdue_bills()`, `cash_in_project_split()`; CFO/CEO blocks and prompt updated. | |
 | 2026-07-01 | Added `payments_received_<date>.xlsx` email attachment (`payments_workbook()`, openpyxl): Detail sheet (one row per payment×invoice with customer + job # / name + class), plus By-job (Production itemized, Service lumped) and By-customer summary sheets. `cash_in_by_project()` extended to also return payment date, customer, and invoice #. Added `openpyxl` to requirements. Values only (no formulas) — the CI runner has no spreadsheet engine to recalc. | |
+| 2026-07-01 | **AP paid by project** (§6f). `ap_paid_by_project()` unions bill payments (VendPymt → bill via `PreviousTransactionLineLink.foreignamount` → bill reporting project) and direct checks (Check expense lines' reporting project); `ap_paid_project_split()` itemizes Production, Other = residual vs the AP-disbursements bucket. Verified 6/30 ties ($60,597.02, all overhead); Production path confirmed on recent 2026 bill payments (e.g. 1478ILM Galleria West $11,834.10). Added to summary (`ap_out`), CFO detail block, and the Excel (renamed `payments_by_project_<date>.xlsx`, now with AP detail + AP by job sheets). CEO block left vendor-itemized. Added `_window_clause()` helper. | |
+| 2026-07-02 | **v3 — five fixes against the 7/1 run** (cash_snap.py commit `113ef71`). (1) **Perimeter → id allowlist** `{223,122}` via `CASH_ACCOUNT_IDS`; dropped Brokerage/FBotL/Petty (§2, §6a/6b). (2)+(3) **class_id string coercion** (`_class_int()`): REST returns `custentity_r_it_class` as `"1"`/`"2"`, so `== 1` collapsed all jobs to Service (blank Class column, no Production breakout, e.g. 1493ILM). Coerced at the source of both by-project queries (§4). (4) **Overdue boundary → inclusive `<=`** (was strict `<`, dropped bills due on the report date; 7/1 undercount $71k vs $153,922.83 / 33); `overdue_bills()` returns the full list; new `overdue_bills_<date>.xlsx` attachment (§6e, §8). (5) **Journal purpose** via `journal_offsets()` (net offsets; liability + Interest ⇒ `suggested_purpose` "Debt Payment - &lt;acct&gt; (P&I)") + prompt update (§7). Verified live via SuiteQL. Requires deleting `state/cash_state.json` before the next run (perimeter re-base). | |
