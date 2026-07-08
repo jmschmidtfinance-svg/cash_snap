@@ -506,24 +506,38 @@ def cash_in_project_split(proj_rows: list[dict], cash_in_total: float) -> dict:
 
 
 def ap_paid_project_split(ap_rows: list[dict], ap_total: float) -> dict:
-    """Split AP cash out: Production itemized by project; everything else (Service-class, no
-    project, overhead/SG&A) as 'Other', computed as the residual against the AP-disbursements
-    total so Production + Other always ties."""
-    prod: dict[tuple, float] = defaultdict(float)
-    attributed = 0.0
-    for r in ap_rows:
-        amt = round(float(r.get("amt") or 0), 2)
-        attributed += amt
-        num = r.get("project_num")
-        if r.get("class_id") == CLASS_PRODUCTION and num:
-            prod[(num, r.get("project_name") or num)] += amt
-    production = [{"project_num": k[0], "project_name": k[1], "amount": round(v, 2)}
-                  for k, v in prod.items()]
-    production.sort(key=lambda x: abs(x["amount"]), reverse=True)
+    """Split AP cash out into job-tied sections, each itemized by job -- and, within each job, by
+    vendor. Production-class jobs and non-Production (Service) jobs get their own sections; only
+    genuinely non-project spend (overhead / SG&A) is 'Other', computed as the residual against the
+    AP-disbursements total so Production + Service + Other always ties. The per-vendor amounts
+    within a job sum to that job's total (same rows, one extra group key)."""
+    def accumulate(pred):
+        by_job: dict[tuple, float] = defaultdict(float)
+        by_vend: dict[tuple, dict] = defaultdict(lambda: defaultdict(float))
+        for r in ap_rows:
+            num = r.get("project_num")
+            if num and pred(r):
+                amt = round(float(r.get("amt") or 0), 2)
+                key = (num, r.get("project_name") or num)
+                by_job[key] += amt
+                by_vend[key][r.get("vendor") or "(no vendor)"] += amt
+        out = []
+        for k, v in by_job.items():
+            vendors = [{"vendor": vn, "amount": round(va, 2)} for vn, va in by_vend[k].items()]
+            vendors.sort(key=lambda x: abs(x["amount"]), reverse=True)
+            out.append({"project_num": k[0], "project_name": k[1],
+                        "amount": round(v, 2), "vendors": vendors})
+        out.sort(key=lambda x: abs(x["amount"]), reverse=True)
+        return out
+    production = accumulate(lambda r: r.get("class_id") == CLASS_PRODUCTION)
+    service    = accumulate(lambda r: r.get("class_id") != CLASS_PRODUCTION)
+    attributed = round(sum(round(float(r.get("amt") or 0), 2) for r in ap_rows), 2)
     prod_sum = round(sum(p["amount"] for p in production), 2)
+    svc_sum  = round(sum(s["amount"] for s in service), 2)
     return {"production": production,
-            "other": round(ap_total - prod_sum, 2),
-            "attributed_total": round(attributed, 2)}
+            "service": service,
+            "other": round(ap_total - prod_sum - svc_sum, 2),
+            "attributed_total": attributed}
 
 
 def build_summary(report: dt.date, prior_date: dt.date, prior_total: float,
@@ -626,6 +640,7 @@ def build_summary(report: dt.date, prior_date: dt.date, prior_total: float,
                     "service": proj_split["service"]},
         "ap_out": {"total": ap_out_total,
                    "production": ap_split["production"],
+                   "service": ap_split["service"],
                    "other": ap_split["other"]},
         "cash_out": {"total": cash_out_total, "items": cash_out_items,
                      "all_others": cash_out_other},
@@ -673,7 +688,10 @@ def write_sections(summary: dict) -> tuple[str, str]:
         "<<<CFO>>>\n"
         "A precise CFO brief. One-line headline, then the drivers (by_bucket and top_movers), "
         "then note collections (cash_in: the Production projects and the Service total), AP paid by "
-        "project (ap_out: the Production projects and the Other total), and overdue unpaid bills "
+        "job (ap_out: the Production jobs and the Service jobs -- each job in production[] and "
+        "service[] has a per-vendor breakdown in [].vendors -- plus the Other/overhead total; call "
+        "out notable job->vendor concentration, e.g. a single sub/supplier that is most of a job's "
+        "spend), and overdue unpaid bills "
         "(unpaid_bills), then every item in 'flags'. Keep full dollar figures with cents. If "
         "'reconciles' is false, lead with that and call the numbers provisional.\n"
         "For any Journal in top_movers, look it up in 'journal_details' by its tranid and STATE ITS "
@@ -813,21 +831,53 @@ def payments_workbook(proj_rows: list[dict], ap_rows: list[dict] | None = None) 
     ws4.append(["", "", "", "", "", "", "", "Total", ap_total])
     style_sheet(ws4, 9, [15, 12, 30, 9, 22, 12, 28, 12, 16], (9,))
 
-    approd: dict[tuple, float] = defaultdict(float)
+    # AP grouped by job, split into Production and Service sections; overhead stays in Other.
+    def job_key(r): return (r["project_num"], r.get("project_name") or r["project_num"])
+    prod_jobs: dict[tuple, float] = defaultdict(float)
+    svc_jobs: dict[tuple, float] = defaultdict(float)
     other = 0.0
     for r in ap:
-        if r.get("class_id") == CLASS_PRODUCTION and r.get("project_num"):
-            approd[(r["project_num"], r.get("project_name") or r["project_num"])] += ap_amt(r)
-        else:
+        if not r.get("project_num"):
             other += ap_amt(r)
+        elif r.get("class_id") == CLASS_PRODUCTION:
+            prod_jobs[job_key(r)] += ap_amt(r)
+        else:
+            svc_jobs[job_key(r)] += ap_amt(r)
     ws5 = wb.create_sheet("AP by job")
-    ws5.append(["Job #", "Job name", "Amount"])
-    for (num, name), v in sorted(approd.items(), key=lambda kv: kv[1], reverse=True):
-        ws5.append([num, name, round(v, 2)])
+    ws5.append(["Class", "Job #", "Job name", "Amount"])
+    for cls, jobs in (("Production", prod_jobs), ("Service", svc_jobs)):
+        for (num, name), v in sorted(jobs.items(), key=lambda kv: kv[1], reverse=True):
+            ws5.append([cls, num, name, round(v, 2)])
     if round(other, 2):
-        ws5.append(["", "Other / non-project", round(other, 2)])
-    ws5.append(["", "Total", ap_total])
-    style_sheet(ws5, 3, [14, 40, 16], (3,))
+        ws5.append(["", "", "Other / non-project", round(other, 2)])
+    ws5.append(["", "", "Total", ap_total])
+    style_sheet(ws5, 4, [12, 14, 40, 16], (4,))
+
+    # AP rolled up by job, then vendor -- Production and Service sections; overhead in Other.
+    def jv_block(pred):
+        jv: dict[tuple, float] = defaultdict(float)
+        for r in ap:
+            if r.get("project_num") and pred(r):
+                jv[(r["project_num"], r.get("project_name") or r["project_num"],
+                    r.get("vendor") or "(no vendor)")] += ap_amt(r)
+        jt: dict[tuple, float] = defaultdict(float)
+        for (num, name, _v), amt in jv.items():
+            jt[(num, name)] += amt
+        return jv, jt
+    ws6 = wb.create_sheet("AP by job x vendor")
+    ws6.append(["Class", "Job #", "Job name", "Vendor", "Amount"])
+    for cls, pred in (("Production", lambda r: r.get("class_id") == CLASS_PRODUCTION),
+                      ("Service", lambda r: r.get("class_id") != CLASS_PRODUCTION)):
+        jv, jt = jv_block(pred)
+        for (num, name) in sorted(jt, key=lambda k: jt[k], reverse=True):
+            vend = sorted([(v, a) for (n, nm, v), a in jv.items() if (n, nm) == (num, name)],
+                          key=lambda x: x[1], reverse=True)
+            for v, a in vend:
+                ws6.append([cls, num, name, v, round(a, 2)])
+    if round(other, 2):
+        ws6.append(["", "", "Other / non-project", "", round(other, 2)])
+    ws6.append(["", "", "", "Total", ap_total])
+    style_sheet(ws6, 5, [12, 14, 34, 30, 16], (5,))
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -908,11 +958,15 @@ def cfo_detail_block(summary: dict) -> str:
     if ap:
         lines.append("")
         lines.append(f"AP paid by project: {ap['total']:,.2f}")
-        if ap.get("production"):
-            lines.append("    Production:")
-            for p in ap["production"]:
-                lines.append(f"        {p['project_num']:<10} {(p['project_name'] or ''):<28} "
-                             f"{p['amount']:>14,.2f}")
+        for section, heading in (("production", "Production (by job, then vendor):"),
+                                 ("service", "Service (by job, then vendor):")):
+            if ap.get(section):
+                lines.append(f"    {heading}")
+                for p in ap[section]:
+                    lines.append(f"        {p['project_num']:<10} {(p['project_name'] or ''):<28} "
+                                 f"{p['amount']:>14,.2f}")
+                    for v in p.get("vendors", []):
+                        lines.append(f"            {(v['vendor'] or ''):<32} {v['amount']:>14,.2f}")
         lines.append(f"    {'Other / non-project:':<39}{ap['other']:>14,.2f}")
     ub = summary.get("unpaid_bills")
     if ub:
