@@ -232,8 +232,8 @@ ORDER BY t.duedate, vendor
 The full list ships as the `overdue_bills_<date>.xlsx` attachment (`overdue_bills_workbook()`,
 openpyxl, most-overdue first) so the AP total can be reconciled line by line.
 
-### 6f. AP paid by project (Production itemized / Other lumped)  ✅ verified 2026-07-01
-The AP-disbursements outflow attributed to projects. Two disjoint paths, unioned; both read the GL
+### 6f. AP paid by job (Production + Service itemized by job × vendor / Other lumped)  ✅ verified 2026-07-01 (Service section added 2026-07-07)
+The AP-disbursements outflow attributed to jobs. Two disjoint paths, unioned; both read the GL
 **reporting project** (`custcol_r_it_reporting_project`). Same roll-forward window as §6b. Verified
 6/30: bill payments $760 + direct checks $59,837.02 = $60,597.02 (ties to the AP bucket; all
 non-project that day). Recent Production example: bill payment → `1478ILM` "Galleria West" $11,834.10.
@@ -265,9 +265,14 @@ JOIN   transaction t ON t.id = tl.transaction
 LEFT JOIN job proj ON proj.id = tl.custcol_r_it_reporting_project
 WHERE  t.type = 'Check' AND tl.mainline = 'F' AND <roll-forward window on t>
 ```
-Code groups class 1 (Production) by project; **Other = residual** vs the AP-disbursements total, so
-Production + Other ties. (Most AP is overhead/SG&A with no project → Other; job-cost subs land on
-Production once bills/checks carry the reporting project.)
+Code itemizes **both** Production-class and Service-class jobs by job — and, within each job, by
+**vendor** — into two sections (`ap_paid_project_split()` → `production[]` and `service[]`, each job
+entry carrying a `vendors[]` list; the per-vendor amounts sum to the job total). Every job-tied bill
+therefore appears under its job regardless of class. **Other = residual** vs the AP-disbursements
+total — genuinely non-project overhead/SG&A only — so Production + Service + Other ties. Job-cost
+subs/suppliers land on a job once bills/checks carry the reporting project; e.g. the 2026-07-07
+window showed ~$25.5k of **Service** job-tied AP across 26 job×vendor rows (Sunbelt Rentals, ABC
+Supply, Construction Metal Products, etc.) that were previously buried in Other.
 
 ### Sign convention  ✅ VERIFIED 2026-06-29
 Cash **increase** posts as positive `tal.amount` (debit-positive). Inflows positive, outflows
@@ -334,7 +339,7 @@ Special rules / exclusions:
 | Report date | Yesterday (the just-closed day), UTC-yesterday at fire time |
 | Compares | Closing cash today vs the last **reported** balance (roll-forward — see §9) |
 | Delivery channel | Email from `jmschmidtfinance@gmail.com` → Jamie's inbox; Jamie forwards to CEO |
-| Attachments | `cash_snap_<date>.json` (full summary), `cash_movements_<date>.csv` (cash line detail), `payments_by_project_<date>.xlsx` (cash in AND out by project — sheets: AR detail [payment×invoice + customer + job], AR by job, AR by customer, AP detail [payment/check + vendor + job], AP by job), `overdue_bills_<date>.xlsx` (every open bill due on/before the report date, most-overdue first — Bill#/Vendor/Bill date/Due date/Days overdue/Bill amount/Unpaid/Status); all openpyxl, values only |
+| Attachments | `cash_snap_<date>.json` (full summary), `cash_movements_<date>.csv` (cash line detail), `payments_by_project_<date>.xlsx` (cash in AND out by job — sheets: AR detail [payment×invoice + customer + job], AR by job, AR by customer, AP detail [payment/check + vendor + job], AP by job [Class column; Production then Service jobs, then Other/non-project], AP by job × vendor [Class/Job/Vendor; Production + Service sections, then Other]), `overdue_bills_<date>.xlsx` (every open bill due on/before the report date, most-overdue first — Bill#/Vendor/Bill date/Due date/Days overdue/Bill amount/Unpaid/Status); all openpyxl, values only |
 | "Call out" threshold | `SNAP_THRESHOLD` = 10000 (any single item/bucket beyond this is flagged) |
 | Format | **Plain text** (no Markdown) |
 
@@ -456,3 +461,4 @@ never categorizes, sums, or reconciles. (Validated end-to-end 2026-06-29.)
 | 2026-07-01 | Added `payments_received_<date>.xlsx` email attachment (`payments_workbook()`, openpyxl): Detail sheet (one row per payment×invoice with customer + job # / name + class), plus By-job (Production itemized, Service lumped) and By-customer summary sheets. `cash_in_by_project()` extended to also return payment date, customer, and invoice #. Added `openpyxl` to requirements. Values only (no formulas) — the CI runner has no spreadsheet engine to recalc. | |
 | 2026-07-01 | **AP paid by project** (§6f). `ap_paid_by_project()` unions bill payments (VendPymt → bill via `PreviousTransactionLineLink.foreignamount` → bill reporting project) and direct checks (Check expense lines' reporting project); `ap_paid_project_split()` itemizes Production, Other = residual vs the AP-disbursements bucket. Verified 6/30 ties ($60,597.02, all overhead); Production path confirmed on recent 2026 bill payments (e.g. 1478ILM Galleria West $11,834.10). Added to summary (`ap_out`), CFO detail block, and the Excel (renamed `payments_by_project_<date>.xlsx`, now with AP detail + AP by job sheets). CEO block left vendor-itemized. Added `_window_clause()` helper. | |
 | 2026-07-02 | **v3 — five fixes against the 7/1 run** (cash_snap.py commit `113ef71`). (1) **Perimeter → id allowlist** `{223,122}` via `CASH_ACCOUNT_IDS`; dropped Brokerage/FBotL/Petty (§2, §6a/6b). (2)+(3) **class_id string coercion** (`_class_int()`): REST returns `custentity_r_it_class` as `"1"`/`"2"`, so `== 1` collapsed all jobs to Service (blank Class column, no Production breakout, e.g. 1493ILM). Coerced at the source of both by-project queries (§4). (4) **Overdue boundary → inclusive `<=`** (was strict `<`, dropped bills due on the report date; 7/1 undercount $71k vs $153,922.83 / 33); `overdue_bills()` returns the full list; new `overdue_bills_<date>.xlsx` attachment (§6e, §8). (5) **Journal purpose** via `journal_offsets()` (net offsets; liability + Interest ⇒ `suggested_purpose` "Debt Payment - &lt;acct&gt; (P&I)") + prompt update (§7). Verified live via SuiteQL. Requires deleting `state/cash_state.json` before the next run (perimeter re-base). | |
+| 2026-07-07 | **AP by job × vendor — Service section** (cash_snap.py commit `302bda48`). §6f previously itemized only Production-class job-tied AP by job×vendor; Service-class job-tied bills fell into the "Other" residual and were never broken out. `ap_paid_project_split()` now returns a parallel `service[]` section (job→vendor, mirroring `production[]`); **Other is the residual after Production AND Service**, i.e. genuinely non-project overhead only, and the AP total still ties. Surfaced in `ap_out` (summary JSON), the CFO narrative prompt, the deterministic `cfo_detail_block` ("Service (by job, then vendor)"), and the Excel workbook (the "AP by job" and "AP by job x vendor" sheets gain a **Class** column and a grouped Service section). Production breakout unchanged. Verified live: ~$25.5k across 26 Service job×vendor rows over the recent window (§6f, §8). | |
