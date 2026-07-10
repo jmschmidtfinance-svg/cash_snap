@@ -71,6 +71,19 @@ CASH_ACCOUNT_IDS = tuple(
     int(x) for x in (os.environ.get("CASH_ACCOUNT_IDS") or "223,122").replace(" ", "").split(",") if x
 )
 
+# The AR total, the AP total, and the unpaid-bills list are each pinned to a specific GL CONTROL
+# account by internal id -- never an account-type sum. Summing every account of a type dragged in
+# contra/retainage accounts: the AR total was summing Accounts Receivable (119) + Retainage
+# Receivables (235) + Allowance for Doubtful Accounts (228), landing ~$90k below the balance-sheet
+# AR line (the 119 control account alone); the AcctPay sum likewise pulled in Retainage Payable.
+# These totals are computed independently of the unpaid-bills list -- nothing is ever subtracted.
+# Override via env if a control account changes. Internal IDs only (we never key on account numbers).
+#     119 = Accounts Receivable        111 = Accounts Payable
+AR_ACCOUNT_IDS = tuple(
+    int(x) for x in (os.environ.get("AR_ACCOUNT_IDS") or "119").replace(" ", "").split(",") if x
+)
+AP_ACCOUNT_ID = int(os.environ.get("AP_ACCOUNT_ID") or "111")
+
 PAYROLL_ACCOUNT_IDS: set[int] = set()
 TOP_CEO_ITEMS = 8            # how many vendors/customers to itemize before "All others"
 EPSILON = 0.01
@@ -286,8 +299,10 @@ def overdue_bills(report: dt.date) -> dict:
     balance. The boundary is INCLUSIVE (<=): a bill due ON the report date is past due by the time
     the snap is read the next morning, and a strict `<` dropped whole days of subcontractor bills
     (e.g. all of a day's roofing subs) from the total -- the source of the ~$70k-vs-actual gap.
-    Returns the aggregate PLUS the full bill list so the summary and the overdue workbook share a
-    single query."""
+    Scoped to the AP control account (AP_ACCOUNT_ID, id 111) so Retainage Payable and other payable
+    accounts don't leak into the figure, and bills flagged payment-hold (paymenthold) are excluded
+    since they're intentionally held from payment. Returns the aggregate PLUS the full bill list so
+    the summary and the overdue workbook share a single query."""
     sql = f"""
         SELECT t.tranid            AS bill_no,
                BUILTIN.DF(t.entity) AS vendor,
@@ -298,8 +313,10 @@ def overdue_bills(report: dt.date) -> dict:
                t.status
         FROM   transaction t
         WHERE  t.type = 'VendBill'
+          AND  t.account = {AP_ACCOUNT_ID}
           AND  t.duedate <= TO_DATE('{report.isoformat()}', 'YYYY-MM-DD')
           AND  t.foreignamountunpaid > 0
+          AND  (t.paymenthold IS NULL OR t.paymenthold = 'F')
         ORDER BY t.duedate, vendor
     """
     bills = []
@@ -1078,8 +1095,8 @@ def main() -> int:
             include_created = True
 
         movements = cash_movements(prior_date, report, include_created)
-        ar_total = abs(total_balance(report, ("AcctRec",)))
-        ap_total = abs(total_balance(report, ("AcctPay",)))
+        ar_total = abs(total_balance(report, (), extra_account_ids=AR_ACCOUNT_IDS))
+        ap_total = abs(total_balance(report, (), extra_account_ids=(AP_ACCOUNT_ID,)))
         proj_rows = cash_in_by_project(prior_date, report, include_created)
         unpaid = overdue_bills(report)
         ap_rows = ap_paid_by_project(prior_date, report, include_created)
