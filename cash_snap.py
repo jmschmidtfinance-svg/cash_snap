@@ -41,6 +41,13 @@ NS_TOKEN_ID     = os.environ["NS_TOKEN_ID"]
 NS_TOKEN_SEC    = os.environ["NS_TOKEN_SECRET"]
 
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+# Output budgets for the two narrative calls. The CFO brief grows with the job count (per-vendor
+# breakdowns, flags), so it gets the generous budget; the CEO block is a fixed-shape text message.
+# A single shared 2000-token call silently truncated mid-CFO on 2026-07-09 and never emitted the
+# CEO section -- see write_sections().
+CFO_MAX_TOKENS = int(os.environ.get("CFO_MAX_TOKENS") or "6000")
+CEO_MAX_TOKENS = int(os.environ.get("CEO_MAX_TOKENS") or "800")
 KB_PATH         = os.environ.get("KB_PATH", "netsuite_knowledge_base.md")
 STATE_PATH      = os.environ.get("STATE_PATH", "state/cash_state.json")
 
@@ -667,7 +674,7 @@ def build_summary(report: dt.date, prior_date: dt.date, prior_total: float,
 
 
 # --------------------------------------------------------------------------------------
-# LLM narrative -- CFO section + CEO text-message block (one call, two delimited parts)
+# LLM narrative -- CFO section + CEO text-message block (two independent calls)
 # --------------------------------------------------------------------------------------
 CEO_STYLE_EXAMPLE = """\
 6/30
@@ -688,59 +695,94 @@ MBFS - $2k
 All others $6k
 """
 
+_SHARED_RULES = (
+    "You produce a daily cash report from FINISHED numbers. Do not recompute, "
+    "re-categorize, or sum -- the figures are authoritative. Output PLAIN TEXT only: no "
+    "Markdown, no asterisks, no pipe tables (the email is plain text). "
+)
 
-def write_sections(summary: dict) -> tuple[str, str]:
-    from anthropic import Anthropic
+CFO_SYSTEM = _SHARED_RULES + (
+    "Write ONLY the CFO brief. No preamble, no delimiters, no CEO summary.\n"
+    "A precise CFO brief. One-line headline, then the drivers (by_bucket and top_movers), "
+    "then note collections (cash_in: the Production projects and the Service total), AP paid by "
+    "job (ap_out: the Production jobs and the Service jobs -- each job in production[] and "
+    "service[] has a per-vendor breakdown in [].vendors -- plus the Other/overhead total; call "
+    "out notable job->vendor concentration, e.g. a single sub/supplier that is most of a job's "
+    "spend), and overdue unpaid bills "
+    "(unpaid_bills), then every item in 'flags'. Keep full dollar figures with cents. If "
+    "'reconciles' is false, lead with that and call the numbers provisional.\n"
+    "For any Journal in top_movers, look it up in 'journal_details' by its tranid and STATE ITS "
+    "PURPOSE from the offset accounts rather than calling it unclassified: if "
+    "'suggested_purpose' is present use it verbatim; otherwise infer from the offsets (e.g. a "
+    "single liability account plus an Interest Expense line is a debt principal-and-interest "
+    "payment -- name it 'Debt Payment - <liability account>'). Name the offset accounts and "
+    "amounts. Do not invent a purpose when the offsets don't support one."
+)
 
-    kb = ""
+CEO_SYSTEM = _SHARED_RULES + (
+    "Write ONLY the CEO text-message summary. No preamble, no delimiters, no CFO brief.\n"
+    "A short text-message-style summary matching the example's format and rounding "
+    "(round to $k/$m, abbreviate vendor/customer names sensibly). Rules:\n"
+    "- Header lines: Cash, AR, AP, then Overdue bills. unpaid_bills is an object "
+    "{basis, count, total}; render 'Overdue bills: $Xk (N)' from total and count. If it is null, "
+    "write 'Overdue bills: [tbd]'.\n"
+    "- Cash in: use cash_in.total for the headline amount. If cash_in.production is non-empty, "
+    "add a 'Production' label then one line per project as 'ProjectName (project_num) - $Xk'; "
+    "omit the label and lines if it is empty. Then 'Service - $Xk' from cash_in.service.\n"
+    "- Cash out: itemize cash_out.items, then 'All others $Xk' for cash_out.all_others.\n"
+    f"Format example:\n{CEO_STYLE_EXAMPLE}"
+)
+
+
+def _kb_text() -> str:
     if os.path.exists(KB_PATH):
         with open(KB_PATH, encoding="utf-8") as f:
-            kb = f.read()
+            return f.read()
+    return ""
 
-    system = (
-        "You produce a daily cash report from FINISHED numbers. Do not recompute, "
-        "re-categorize, or sum -- the figures are authoritative. Output PLAIN TEXT only: no "
-        "Markdown, no asterisks, no pipe tables (the email is plain text). Return EXACTLY two "
-        "sections separated by the delimiters shown, nothing before or after:\n"
-        "<<<CFO>>>\n"
-        "A precise CFO brief. One-line headline, then the drivers (by_bucket and top_movers), "
-        "then note collections (cash_in: the Production projects and the Service total), AP paid by "
-        "job (ap_out: the Production jobs and the Service jobs -- each job in production[] and "
-        "service[] has a per-vendor breakdown in [].vendors -- plus the Other/overhead total; call "
-        "out notable job->vendor concentration, e.g. a single sub/supplier that is most of a job's "
-        "spend), and overdue unpaid bills "
-        "(unpaid_bills), then every item in 'flags'. Keep full dollar figures with cents. If "
-        "'reconciles' is false, lead with that and call the numbers provisional.\n"
-        "For any Journal in top_movers, look it up in 'journal_details' by its tranid and STATE ITS "
-        "PURPOSE from the offset accounts rather than calling it unclassified: if "
-        "'suggested_purpose' is present use it verbatim; otherwise infer from the offsets (e.g. a "
-        "single liability account plus an Interest Expense line is a debt principal-and-interest "
-        "payment -- name it 'Debt Payment - <liability account>'). Name the offset accounts and "
-        "amounts. Do not invent a purpose when the offsets don't support one.\n"
-        "<<<CEO>>>\n"
-        "A short text-message-style summary matching the example's format and rounding "
-        "(round to $k/$m, abbreviate vendor/customer names sensibly). Rules:\n"
-        "- Header lines: Cash, AR, AP, then Overdue bills. unpaid_bills is an object "
-        "{basis, count, total}; render 'Overdue bills: $Xk (N)' from total and count. If it is null, "
-        "write 'Overdue bills: [tbd]'.\n"
-        "- Cash in: use cash_in.total for the headline amount. If cash_in.production is non-empty, "
-        "add a 'Production' label then one line per project as 'ProjectName (project_num) - $Xk'; "
-        "omit the label and lines if it is empty. Then 'Service - $Xk' from cash_in.service.\n"
-        "- Cash out: itemize cash_out.items, then 'All others $Xk' for cash_out.all_others.\n"
-        f"Format example:\n{CEO_STYLE_EXAMPLE}"
-    )
-    user = (f"KNOWLEDGE BASE:\n{kb}\n\nTODAY'S COMPUTED SUMMARY (JSON):\n"
+
+def _narrate(system: str, summary: dict, max_tokens: int, label: str) -> str:
+    """One Anthropic call -> plain text. Fails LOUDLY.
+
+    A truncated or empty section used to sail straight into the email: the old single call packed
+    both sections behind a <<<CEO>>> delimiter, and when the response hit max_tokens mid-CFO the
+    delimiter never appeared, so the CEO block was mailed as an empty string with no error. A run
+    that dies and pages us (main -> send_alert) beats a run that quietly ships a blank section.
+    """
+    from anthropic import Anthropic
+
+    user = (f"KNOWLEDGE BASE:\n{_kb_text()}\n\nTODAY'S COMPUTED SUMMARY (JSON):\n"
             f"{json.dumps(summary, indent=2, default=str)}")
-
     client = Anthropic()
-    resp = client.messages.create(model=ANTHROPIC_MODEL, max_tokens=2000,
+    resp = client.messages.create(model=ANTHROPIC_MODEL, max_tokens=max_tokens,
                                   system=system, messages=[{"role": "user", "content": user}])
-    text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
-    cfo, ceo = text, ""
-    if "<<<CEO>>>" in text:
-        cfo, ceo = text.split("<<<CEO>>>", 1)
-    cfo = cfo.replace("<<<CFO>>>", "").strip()
-    return cfo, ceo.strip()
+    stop = getattr(resp, "stop_reason", None)
+    text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
+    if stop == "max_tokens":
+        raise RuntimeError(
+            f"{label} narrative truncated at max_tokens={max_tokens} (stop_reason=max_tokens). "
+            f"Raise {label.upper()}_MAX_TOKENS.")
+    if not text:
+        raise RuntimeError(f"{label} narrative came back empty (stop_reason={stop}).")
+    return text
+
+
+def write_cfo(summary: dict) -> str:
+    return _narrate(CFO_SYSTEM, summary, CFO_MAX_TOKENS, "cfo")
+
+
+def write_ceo(summary: dict) -> str:
+    return _narrate(CEO_SYSTEM, summary, CEO_MAX_TOKENS, "ceo")
+
+
+def write_sections(summary: dict) -> tuple[str, str]:
+    """CFO brief and CEO block from two INDEPENDENT calls, so no amount of CFO growth can starve
+    the CEO block. The CEO summary is generated first: it is the section the CEO actually reads,
+    it is cheap, and failing on it early avoids paying for the long CFO call.
+    """
+    ceo = write_ceo(summary)
+    cfo = write_cfo(summary)
+    return cfo, ceo
 
 
 # --------------------------------------------------------------------------------------
