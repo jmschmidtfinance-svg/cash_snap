@@ -168,16 +168,31 @@ WHERE  a.id IN (223, 122)                            -- explicit cash perimeter 
 ORDER BY tal.amount
 ```
 
-### 6c. AR / AP totals (for the CEO block)  `[ ] verify`
-Totals by account type as of the report date. AP is a liability (credit balance), so present
-its absolute value.
+### 6c. AR / AP totals (for the CEO block)  ✅ verified 2026-07-08
+Each total is the balance of a single GL **control account**, pinned by **internal id** — never a sum
+over an account *type*. AP is a liability (credit balance), so present its absolute value.
+
+| Total | Control account | Internal id | Balance 2026-07-07 |
+|---|---|---|---|
+| `ar_total` | Accounts Receivable | **119** | $5,430,902.44 |
+| `ap_total` | Accounts Payable | **111** | $2,814,073.01 (abs) |
+
+Summing by `accttype` was wrong, and shipped a bad AR figure on the 7/7 run. Type `AcctRec` also
+matches **Retainage Receivables (id 235, −$40,022.62)** and **Allowance for Doubtful Accounts
+(id 228, −$50,000.00)**, so the snap reported $5,340,879.82 against a balance-sheet AR line of
+$5,430,902.44 — understated by exactly $90,022.62. Type `AcctPay` likewise matches **Retainage
+Payable (id 245)** and **Retainage Payable - Procore (id 260)**, which together netted ~$4,963.11
+against AP. Override via `AR_ACCOUNT_IDS` / `AP_ACCOUNT_ID` if a control account ever changes.
+
+**These are independent GL balances.** Neither is ever touched by the unpaid-bills logic (§6e):
+overdue bills are a separately reported figure, and nothing is subtracted from AR or AP.
 
 ```sql
 SELECT SUM(tal.amount) AS balance
 FROM   transactionaccountingline tal
 JOIN   transaction t ON t.id = tal.transaction
 JOIN   account a     ON a.id = tal.account
-WHERE  a.accttype = :type            -- 'AcctRec' for AR, 'AcctPay' for AP
+WHERE  a.id IN (:control_account_ids)   -- 119 = AR, 111 = AP  (INTERNAL ids, not acct numbers)
   AND  tal.posting = 'T'
   AND  t.trandate <= TO_DATE(:report_date, 'YYYY-MM-DD')
 ```
@@ -211,7 +226,7 @@ Code then groups class 1 (Production) by project #/name; **Service = the residua
 AR inflow total, so Production + Service always ties. `PreviousTransactionLineLink` link fields:
 `nextdoc`=payment, `previousdoc`=invoice, `previoustype`='CustInvc', `foreignamount`=applied amount.
 
-### 6e. Overdue unpaid bills  ✅ verified 2026-07-01 (boundary fixed)
+### 6e. Overdue unpaid bills  ✅ verified 2026-07-08 (boundary fixed 07-02; scoped to the AP control account 07-08)
 Open vendor bills due **on or before** the report date, at remaining (unpaid) balance. Open =
 `foreignamountunpaid > 0` (header field). **Boundary is INCLUSIVE (`<=`).** It was originally strict
 `<`, which dropped every bill due *on* the report date — for 7/1 that hid ~$82.7k of subcontractor
@@ -220,17 +235,27 @@ bills (roofing subs + Watco + AXA) and undercounted overdue by more than half ($
 so it belongs. No null-amount or missing-duedate rows exist. `overdue_bills()` now returns the full
 bill list (with `days_overdue`), and the summary carries the aggregate `{basis, asof, count, total}`.
 
+**Scope (2026-07-08).** Only bills posted to the **AP control account (internal id 111)** count, and
+bills flagged **payment hold** (`t.paymenthold = 'T'`) are excluded — they are deliberately withheld
+from payment, so they are not actionably overdue. As of 2026-07-07 this moved the figure from 31
+bills / $182,077.39 to **29 bills / $171,746.64**: it drops one on-hold bill ($10,000.00) and one
+bill sitting in Retainage Payable (id 245, $330.75). On a VendBill, `t.account` is the bill's AP
+account and `t.paymenthold` is `'T'`/`'F'`.
+
 ```sql
 SELECT t.tranid AS bill_no, BUILTIN.DF(t.entity) AS vendor, t.trandate, t.duedate,
        ABS(t.foreigntotal) AS bill_amount, t.foreignamountunpaid AS unpaid, t.status
 FROM   transaction t
 WHERE  t.type = 'VendBill'
+  AND  t.account = 111                                    -- AP control account (INTERNAL id)
   AND  t.duedate <= TO_DATE(:report_date, 'YYYY-MM-DD')   -- INCLUSIVE
   AND  t.foreignamountunpaid > 0
+  AND  (t.paymenthold IS NULL OR t.paymenthold = 'F')     -- exclude bills held from payment
 ORDER BY t.duedate, vendor
 ```
 The full list ships as the `overdue_bills_<date>.xlsx` attachment (`overdue_bills_workbook()`,
-openpyxl, most-overdue first) so the AP total can be reconciled line by line.
+openpyxl, most-overdue first) so the overdue total can be reconciled line by line. (It reconciles the
+overdue figure — not `ap_total`, which is the §6c control-account balance and unrelated.)
 
 ### 6f. AP paid by job (Production + Service itemized by job × vendor / Other lumped)  ✅ verified 2026-07-01 (Service section added 2026-07-07)
 The AP-disbursements outflow attributed to jobs. Two disjoint paths, unioned; both read the GL
@@ -366,7 +391,9 @@ Service - $6k
 Cash out: $61k
 <itemized, top ~8 then "All others $X">
 ```
-- **Cash** = Bank + Undeposited Funds. **AR** = AcctRec total. **AP** = AcctPay total (abs).
+- **Cash** = Bank + Undeposited Funds. **AR** = the Accounts Receivable control account (internal id
+  119). **AP** = the Accounts Payable control account (internal id 111), abs. Neither is affected by
+  overdue bills — see §6c.
 - **Overdue bills** — open vendor bills past due date (§6e), shown as `$total (count)`. The summary
   carries `unpaid_bills = {basis:"due on or before report date", asof, count, total}`; if null, render `[tbd]`. Full per-bill list ships in `overdue_bills_<date>.xlsx`.
 - **Cash in** — split by project (§6d/§7): **Production** itemized as `Name (project#) - $Xk`;
@@ -383,7 +410,8 @@ balances, large single transactions, reconciliation mismatch, and the bootstrap 
 [GitHub Actions cron ~00:30 ET] -> [SuiteQL: §6a balances, §6b roll-forward movements, §6c AR/AP]
   -> [code: read prior reported balance from state, bucketize per §7, net, reconcile, flag]
   -> [structured summary JSON]
-  -> [one Anthropic API call: summary + this KB -> CFO narrative + CEO block]
+  -> [Anthropic call 1: summary + this KB -> CEO block]   (800 tok)
+  -> [Anthropic call 2: summary + this KB -> CFO narrative] (6000 tok)
   -> [email to Jamie; write state/cash_state.json; workflow commits it back]
 ```
 
@@ -393,8 +421,9 @@ balances, large single transactions, reconciliation mismatch, and the bootstrap 
 | Language | Python |
 | Secrets store | GitHub Actions encrypted secrets |
 | LLM model | claude-sonnet-4-6 |
+| Narrative calls | **Two independent calls**: `write_ceo()` (`CEO_MAX_TOKENS`, default 800) runs first, then `write_cfo()` (`CFO_MAX_TOKENS`, default 6000). Separate budgets mean CFO growth can never starve the CEO block |
 | State / audit ledger | `state/cash_state.json`, committed back to the repo each run (needs `permissions: contents: write` + "Read and write" workflow permission enabled) |
-| Failure handling | Alert email on empty results, SuiteQL error, or reconciliation mismatch |
+| Failure handling | Alert email on empty results, SuiteQL error, reconciliation mismatch, or a narrative call that truncates (`stop_reason = max_tokens`) or returns empty text. `write_sections()` runs before `send_email()` and `save_state()`, so a failure pages us, sends nothing, and leaves the state ledger untouched for a clean re-run |
 
 **Roll-forward reconciliation.** The prior balance is the **last reported** figure read from
 `state/cash_state.json` — not a freshly recomputed prior — so the day-over-day story matches
@@ -445,6 +474,19 @@ never categorizes, sums, or reconciles. (Validated end-to-end 2026-06-29.)
 - **Journals hitting cash** are now labeled by purpose via `journal_offsets()` (netted offset
   accounts; one liability + Interest Expense ⇒ debt P&I, e.g. "Debt Payment - SBA Loan (P&I)").
   Small bank-interest journals (only an income offset) remain `Other / unclassified`. See §7.
+- **"Account id" always means the INTERNAL id — never the account number (2026-07-08).** All code
+  keys on `account.id`. The trap that motivated the rule: account **number** 111 is *Retainage
+  Receivables*, whose internal **id** is 235, while the AP control account's internal **id** is 111
+  (its number is 200). Same shape for "Retainage Payable - Procore": internal id **260**, number 237.
+  Always name accounts by internal id (and full name), never by number.
+- **Retainage balances do not come from the GL posting register (open question, 2026-07-08).** As of
+  7/7 the posting balance (`posting = 'T'`) of Retainage Receivables (id 235) is −$40,022.62 across
+  just 29 lines, while that same account carries **61 non-posting (`posting = 'F'`) lines totalling
+  $9,125,068.89**. Retainage Payable - Procore (id 260) posts to +$20,693.86 across 88 lines. The
+  balances Jamie reads ($2,288,122.67 and −$402,295.32) match neither, so they are sourced from
+  something other than the GL account register — most likely the Procore/RABB-IT retainage subledger.
+  This does **not** affect §6c: AR (119) and AP (111) reconcile to the balance sheet exactly on
+  `posting = 'T'`. Unresolved — identify the source report before attempting a reconciliation.
 - `[FILL IN — month-end timing effects, holiday calendars, when deposits clear, etc.]`
 
 ---
@@ -462,3 +504,5 @@ never categorizes, sums, or reconciles. (Validated end-to-end 2026-06-29.)
 | 2026-07-01 | **AP paid by project** (§6f). `ap_paid_by_project()` unions bill payments (VendPymt → bill via `PreviousTransactionLineLink.foreignamount` → bill reporting project) and direct checks (Check expense lines' reporting project); `ap_paid_project_split()` itemizes Production, Other = residual vs the AP-disbursements bucket. Verified 6/30 ties ($60,597.02, all overhead); Production path confirmed on recent 2026 bill payments (e.g. 1478ILM Galleria West $11,834.10). Added to summary (`ap_out`), CFO detail block, and the Excel (renamed `payments_by_project_<date>.xlsx`, now with AP detail + AP by job sheets). CEO block left vendor-itemized. Added `_window_clause()` helper. | |
 | 2026-07-02 | **v3 — five fixes against the 7/1 run** (cash_snap.py commit `113ef71`). (1) **Perimeter → id allowlist** `{223,122}` via `CASH_ACCOUNT_IDS`; dropped Brokerage/FBotL/Petty (§2, §6a/6b). (2)+(3) **class_id string coercion** (`_class_int()`): REST returns `custentity_r_it_class` as `"1"`/`"2"`, so `== 1` collapsed all jobs to Service (blank Class column, no Production breakout, e.g. 1493ILM). Coerced at the source of both by-project queries (§4). (4) **Overdue boundary → inclusive `<=`** (was strict `<`, dropped bills due on the report date; 7/1 undercount $71k vs $153,922.83 / 33); `overdue_bills()` returns the full list; new `overdue_bills_<date>.xlsx` attachment (§6e, §8). (5) **Journal purpose** via `journal_offsets()` (net offsets; liability + Interest ⇒ `suggested_purpose` "Debt Payment - &lt;acct&gt; (P&I)") + prompt update (§7). Verified live via SuiteQL. Requires deleting `state/cash_state.json` before the next run (perimeter re-base). | |
 | 2026-07-07 | **AP by job × vendor — Service section** (cash_snap.py commit `302bda48`). §6f previously itemized only Production-class job-tied AP by job×vendor; Service-class job-tied bills fell into the "Other" residual and were never broken out. `ap_paid_project_split()` now returns a parallel `service[]` section (job→vendor, mirroring `production[]`); **Other is the residual after Production AND Service**, i.e. genuinely non-project overhead only, and the AP total still ties. Surfaced in `ap_out` (summary JSON), the CFO narrative prompt, the deterministic `cfo_detail_block` ("Service (by job, then vendor)"), and the Excel workbook (the "AP by job" and "AP by job x vendor" sheets gain a **Class** column and a grouped Service section). Production breakout unchanged. Verified live: ~$25.5k across 26 Service job×vendor rows over the recent window (§6f, §8). | |
+| 2026-07-08 | **AR/AP totals pinned to control accounts; unpaid bills scoped** (cash_snap.py commit `99270e1a`). `ar_total` summed every `AcctRec` account — Accounts Receivable (119) **plus** Retainage Receivables (235, −$40,022.62) and Allowance for Doubtful Accounts (228, −$50,000) — reporting $5,340,879.82 against a balance-sheet AR line of $5,430,902.44 (gap exactly $90,022.62). `ap_total` had the same shape (two Retainage Payable accounts netting ~$4,963.11 against AP). Both are now pinned to their control account by **internal id** via `AR_ACCOUNT_IDS` (119) / `AP_ACCOUNT_ID` (111), and remain independent GL balances — the unpaid-bills list is reported separately and never subtracted (§6c). `overdue_bills()` is now scoped to `t.account = 111` and excludes `paymenthold` bills: 31/$182,077.39 → **29/$171,746.64** on 7/7 (§6e). Convention fixed: internal ids only, never account numbers (§10). Verified live via SuiteQL. | |
+| 2026-07-10 | **Narrative split into two calls; loud failure on truncation** (cash_snap.py commit `c4213945`). The 7/9 email shipped an **empty CEO section**: both sections came from one call capped at `max_tokens=2000`, CFO first, split on a `<<<CEO>>>` delimiter — the response was cut off mid-sentence in flag 9 before the delimiter was emitted, so `write_sections()` fell through to `ceo = ""` and `send_email()` mailed a blank block with no error. Now `write_ceo()` (800 tok, runs first) and `write_cfo()` (6000 tok) are independent calls with independent budgets, and `_narrate()` raises on `stop_reason == "max_tokens"` or empty text → `main()` fires `send_alert()`, sends no email, and leaves `state/cash_state.json` untouched. Delimiter machinery removed; prompts split into `CFO_SYSTEM` / `CEO_SYSTEM` (§8, §9). | |
