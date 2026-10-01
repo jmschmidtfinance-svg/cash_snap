@@ -1,12 +1,13 @@
 name: Daily cash snap
 
 on:
-  schedule:
-    # 05:30 UTC = just after midnight US/Eastern year-round (00:30 EST / 01:30 EDT), so the
-    # reported day is fully closed before we pull. report_date defaults to "yesterday".
-    # GitHub cron is best-effort; a missed run self-heals because the roll-forward reconciles
-    # against the last *logged* balance over whatever gap occurred.
-    - cron: "30 5 * * *"
+  # 2026-10-01: the GitHub cron ("30 5 * * *") was firing 4-6 hours late every day
+  # (runs landed 09:38Z-11:50Z through late September), so the daily run is now started
+  # by a Claude scheduled task ("Cash snap - 2am ET dispatch") via workflow_dispatch at
+  # 1:57am US/Eastern. Jamie needs the email by 6:30am ET. The schedule block is removed
+  # so the delayed cron cannot send a second copy of the same day. report_date still
+  # defaults to "yesterday"; a missed run self-heals because the roll-forward reconciles
+  # against the last *logged* balance over whatever gap occurred.
   workflow_dispatch:
     inputs:
       report_date:
