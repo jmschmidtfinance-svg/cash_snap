@@ -1,14 +1,14 @@
 {
-  "report_date": "2026-11-19",
-  "total_cash": 2257478.39,
+  "report_date": "2026-11-20",
+  "total_cash": 2435092.45,
   "balances": {
     "122": {
       "name": "Undeposited Funds",
-      "balance": 0.0
+      "balance": 45038.76
     },
     "223": {
       "name": "First Bank",
-      "balance": 2257478.39
+      "balance": 2390053.69
     }
   }
 }
